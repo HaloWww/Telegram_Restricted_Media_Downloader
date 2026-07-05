@@ -428,7 +428,44 @@ class TelegramRestrictedMediaDownloader(Bot):
 
         if links is None:
             return None
+        if with_upload:
+            await self.__create_download_tasks_from_bot(
+                links=links,
+                invalid_link=invalid_link,
+                right_link=right_link,
+                exist_link=exist_link,
+                client=client,
+                message=message,
+                last_bot_message=last_bot_message,
+                with_upload=with_upload
+            )
+        else:
+            self.loop.create_task(
+                self.__create_download_tasks_from_bot(
+                    links=links,
+                    invalid_link=invalid_link,
+                    right_link=right_link,
+                    exist_link=exist_link,
+                    client=client,
+                    message=message,
+                    last_bot_message=last_bot_message
+                )
+            )
+
+    async def __create_download_tasks_from_bot(
+            self,
+            links: set,
+            invalid_link: set,
+            right_link: set,
+            exist_link: set,
+            client: pyrogram.Client,
+            message: pyrogram.types.Message,
+            last_bot_message: Union[pyrogram.types.Message, None],
+            with_upload: Union[dict, None] = None
+    ) -> None:
         for link in links:
+            if not with_upload:
+                self.bot_task_link.add(link)
             task: dict = await self.create_download_task(
                 message_ids=link,
                 retry=None,
@@ -436,18 +473,23 @@ class TelegramRestrictedMediaDownloader(Bot):
                 request_client=client,
                 request_message=message
             )
-            invalid_link.add(link) if task.get('status') == DownloadStatus.FAILURE else self.bot_task_link.add(link)
+            if task.get('status') == DownloadStatus.FAILURE:
+                invalid_link.add(link)
+                self.bot_task_link.discard(link)
+            else:
+                self.bot_task_link.add(link)
         right_link -= invalid_link
-        await self.safe_edit_message(
-            client=client,
-            message=message,
-            last_message_id=last_bot_message.id,
-            text=self.update_text(
-                right_link=right_link,
-                exist_link=exist_link if not with_upload else None,
-                invalid_link=invalid_link
+        if last_bot_message:
+            await self.safe_edit_message(
+                client=client,
+                message=message,
+                last_message_id=last_bot_message.id,
+                text=self.update_text(
+                    right_link=right_link,
+                    exist_link=exist_link if not with_upload else None,
+                    invalid_link=invalid_link
+                )
             )
-        )
 
     async def get_upload_link_from_bot(
             self,
