@@ -72,6 +72,32 @@ class TelegramRestrictedMediaDownloaderArgumentParser(ArgumentParser):
             help='设置内存下载容量上限(MB),0为关闭'
         )
         self.add_argument(
+            '--install-service',
+            action='store_true',
+            default=False,
+            help='安装Linux systemd服务'
+        )
+        self.add_argument(
+            '--uninstall-service',
+            action='store_true',
+            default=False,
+            help='卸载Linux systemd服务'
+        )
+        self.add_argument(
+            '--service-name',
+            type=str,
+            required=False,
+            default='trmd',
+            help='设置Linux systemd服务名称'
+        )
+        self.add_argument(
+            '--service-port',
+            type=int,
+            required=False,
+            default=2921,
+            help='设置Linux systemd服务Web端口(配合--web使用)'
+        )
+        self.add_argument(
             '-w', '--web',
             type=int,
             nargs='?',

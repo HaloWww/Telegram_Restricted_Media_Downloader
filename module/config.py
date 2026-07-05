@@ -154,6 +154,8 @@ class UserConfig(BaseConfig):
         'save_directory': None,  # v1.3.0 将配置文件中save_path的参数名修改为save_directory。
         'temp_directory': None,
         'memory_download_limit': 0,  # 内存下载容量上限(MB),0为关闭。
+        'video_filename_default_mode': 'new',  # 视频命名默认逻辑:new或old。
+        'video_filename_prompt_timeout': 5,  # 视频命名选择等待秒数,0为不等待。
         'max_tasks': {
             'download': None,
             'upload': None
@@ -206,6 +208,10 @@ class UserConfig(BaseConfig):
         self.memory_download_limit: int = self.normalize_memory_download_limit(
             self.config.get('memory_download_limit'))
         self.memory_download_limit_bytes: int = self.memory_download_limit * 1024 * 1024
+        self.video_filename_default_mode: str = self.normalize_video_filename_default_mode(
+            self.config.get('video_filename_default_mode'))
+        self.video_filename_prompt_timeout: int = self.normalize_video_filename_prompt_timeout(
+            self.config.get('video_filename_prompt_timeout'))
 
     @staticmethod
     def normalize_memory_download_limit(value) -> int:
@@ -214,6 +220,18 @@ class UserConfig(BaseConfig):
             return max(0, int(value or 0))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def normalize_video_filename_default_mode(value) -> str:
+        value = str(value or 'new').strip().lower()
+        return value if value in ('new', 'old') else 'new'
+
+    @staticmethod
+    def normalize_video_filename_prompt_timeout(value) -> int:
+        try:
+            return max(0, int(value if value is not None else 5))
+        except (TypeError, ValueError):
+            return 5
 
     def get_last_history_record(self) -> None:
         """获取最近一次保存的历史配置文件。"""
@@ -409,6 +427,10 @@ class UserConfig(BaseConfig):
             _is_shutdown: Union[bool, None] = pre_load_config.get('is_shutdown')
             _memory_download_limit: int = self.normalize_memory_download_limit(
                 pre_load_config.get('memory_download_limit'))
+            _video_filename_default_mode: str = self.normalize_video_filename_default_mode(
+                pre_load_config.get('video_filename_default_mode'))
+            _video_filename_prompt_timeout: int = self.normalize_video_filename_prompt_timeout(
+                pre_load_config.get('video_filename_prompt_timeout'))
             _proxy_config: dict = pre_load_config.get('proxy', {})
             _enable_proxy: Union[str, bool] = _proxy_config.get('enable_proxy', False)
             _proxy_scheme: Union[str, bool] = _proxy_config.get('scheme', False)
@@ -581,6 +603,8 @@ class UserConfig(BaseConfig):
             pre_load_config['temp_directory'] = PARSE_ARGS.temp
         pre_load_config['memory_download_limit'] = self.normalize_memory_download_limit(
             PARSE_ARGS.memory if PARSE_ARGS.memory is not None else _memory_download_limit)
+        pre_load_config['video_filename_default_mode'] = _video_filename_default_mode
+        pre_load_config['video_filename_prompt_timeout'] = _video_filename_prompt_timeout
         self.save_config(pre_load_config)  # v1.3.0 修复不保存配置文件时,配置文件仍然保存的问题。
 
     def save_config(self, config: dict) -> None:

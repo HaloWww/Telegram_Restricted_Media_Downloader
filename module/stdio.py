@@ -437,6 +437,8 @@ class StatisticalTable:
                 'session_directory': app.work_directory,
                 'temp_directory': app.temp_directory,
                 'memory_download_limit': app.memory_download_limit,
+                'video_filename_default_mode': app.video_filename_default_mode,
+                'video_filename_prompt_timeout': app.video_filename_prompt_timeout,
                 'enable_proxy': app.enable_proxy
             }
         )
@@ -453,6 +455,8 @@ class StatisticalTable:
                 ['会话目录', app.work_directory],
                 ['缓存目录', app.temp_directory],
                 ['内存下载上限(MB)', app.memory_download_limit],
+                ['视频命名默认逻辑', app.video_filename_default_mode],
+                ['视频命名选择超时(秒)', app.video_filename_prompt_timeout],
                 ['使用系统代理', app.enable_proxy]
             ],
             show_lines=True

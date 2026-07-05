@@ -148,7 +148,7 @@ if __name__ == '__main__':
         years = __update_date__[:4]
         include_module = '--include-module=pygments.lexers.data'
         copy_right = f'Copyright (C) 2024-{years} {AUTHOR}.All rights reserved.'
-        build_command = f'nuitka --standalone --onefile {include_module} '
+        build_command = f'nuitka --standalone --onefile --jobs={os.cpu_count()} {include_module} '
         build_command += f'--output-dir={output} --file-version={__version__} --product-version={__version__} '
         build_command += f'--windows-icon-from-ico="{ico_path}" --assume-yes-for-downloads '
         build_command += f'--output-filename="{SOFTWARE_SHORT_NAME}{extension}" --copyright="{copy_right}" --msvc=latest '

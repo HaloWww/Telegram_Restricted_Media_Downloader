@@ -1404,6 +1404,7 @@ class BotCommandText:
     HELP: tuple = ('help', '展示可用命令。')
     DOWNLOAD: tuple = (
         'download', '分配新的下载任务(多种使用方式见使用说明)。\n`/download https://t.me/x/x 起始ID 结束ID`')
+    TASKS: tuple = ('tasks', '查看当前下载任务与进度。')
     TABLE: tuple = ('table', '在终端输出当前下载情况的统计信息。')
     FORWARD: tuple = ('forward', '从频道A转发至频道B 起始ID 结束ID。\n`/forward https://t.me/A https://t.me/B 1 100`')
     EXIT: tuple = ('exit', '退出软件。')
@@ -1427,6 +1428,9 @@ class BotCallbackText:
     LINK_TABLE: str = 'link_table'
     COUNT_TABLE: str = 'count_table'
     UPLOAD_TABLE: str = 'upload_table'
+    DOWNLOAD_TASKS: str = 'download_tasks'
+    DOWNLOAD_TASK_CANCEL: str = 'download_task_cancel'
+    DOWNLOAD_TASK_CANCEL_CONFIRM: str = 'download_task_cancel_confirm'
     BACK_HELP: str = 'back_help'
     BACK_TABLE: str = 'back_table'
     NOTICE: str = 'notice'
@@ -1508,6 +1512,7 @@ class BotButton:
     LINK_TABLE: str = '🔗链接统计表'
     COUNT_TABLE: str = '➕计数统计表'
     UPLOAD_TABLE: str = '📤上传统计表'
+    DOWNLOAD_TASKS: str = '📥下载任务'
     HELP_PAGE: str = '🛎️帮助页面'
     CLICK_VIEW: str = '🖱点击查看'
     CLICK_DOWNLOAD: str = '🖱点击下载'

@@ -5,6 +5,7 @@
 # File:app.py
 import os
 import re
+import sys
 import time
 import datetime
 import subprocess
@@ -70,7 +71,8 @@ class Application(UserConfig, StatisticalTable):
     def get_temp_file_path(
             self,
             message: pyrogram.types.Message,
-            dtype: str
+            dtype: str,
+            video_filename_mode: Union[str, None] = None
     ) -> str:
         """获取下载文件时的临时保存路径。"""
 
@@ -89,7 +91,13 @@ class Application(UserConfig, StatisticalTable):
             return _file
 
         os.makedirs(self.temp_directory, exist_ok=True)
-        dt = DownloadFileName(message=message, download_type=dtype)
+        dt = DownloadFileName(
+            message=message,
+            download_type=dtype,
+            video_filename_default_mode=self.video_filename_default_mode,
+            video_filename_prompt_timeout=self.video_filename_prompt_timeout,
+            video_filename_mode=video_filename_mode
+        )
         if dtype in (DownloadType.VIDEO, DownloadType.VIDEO_NOTE):
             file_name: str = dt.get_video_filename()
         elif dtype == DownloadType.PHOTO:
@@ -224,10 +232,22 @@ class DownloadFileName:
     def __init__(
             self,
             message: pyrogram.types.Message,
-            download_type: Union[str, "DownloadType"]
+            download_type: Union[str, "DownloadType"],
+            video_filename_default_mode: str = 'new',
+            video_filename_prompt_timeout: int = 5,
+            video_filename_mode: Union[str, None] = None
     ):
         self.message = message
         self.download_type = download_type
+        self.video_filename_default_mode = video_filename_default_mode if video_filename_default_mode in ('new', 'old') else 'new'
+        self.video_filename_mode = video_filename_mode if video_filename_mode in ('new', 'old') else None
+        try:
+            self.video_filename_prompt_timeout = max(
+                0,
+                int(video_filename_prompt_timeout if video_filename_prompt_timeout is not None else 5)
+            )
+        except (TypeError, ValueError):
+            self.video_filename_prompt_timeout = 5
 
     @staticmethod
     def __safe_text_filename(text: Union[str, None]) -> Union[str, None]:
@@ -239,37 +259,113 @@ class DownloadFileName:
         text = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]+', '-', text)
         return text.strip(' .-') or None
 
-    def get_video_filename(self):
-        """处理视频文件的文件名。"""
-        default_mtype: str = 'video/mp4'  # v1.2.8 健全获取文件名逻辑。
-        media_object = getattr(self.message, self.download_type)
-        title: Union[str, None] = self.__safe_text_filename(
+    @staticmethod
+    def __format_video_filename(message_id, title: str, extension: str) -> str:
+        return '{} - {}.{}'.format(message_id, title, extension)
+
+    @staticmethod
+    def __timed_input(prompt: str, timeout: int) -> str:
+        if timeout <= 0 or not sys.stdin.isatty():
+            return ''
+        console.print(prompt, end='')
+        if sys.platform == 'win32':
+            try:
+                import msvcrt
+                end_time = time.time() + timeout
+                chars = []
+                while time.time() < end_time:
+                    if msvcrt.kbhit():
+                        char = msvcrt.getwch()
+                        if char in ('\r', '\n'):
+                            print()
+                            return ''.join(chars).strip()
+                        if char in ('\x08', '\b'):
+                            if chars:
+                                chars.pop()
+                                print('\b \b', end='', flush=True)
+                            continue
+                        if char in ('\x00', '\xe0'):
+                            msvcrt.getwch()
+                            continue
+                        chars.append(char)
+                        console.print(char, end='')
+                    time.sleep(0.05)
+                print()
+                return ''
+            except Exception:
+                return ''
+        try:
+            import select
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            if ready:
+                return sys.stdin.readline().strip()
+            console.print()
+            return ''
+        except Exception:
+            return ''
+
+    def __legacy_video_title(self, media_object) -> str:
+        title: Union[str, None] = getattr(media_object, 'file_name', None)
+        try:
+            if isinstance(title, str):
+                if title.lower().startswith('video_'):
+                    title = None
+                else:
+                    title = os.path.splitext(title)[0]
+            if title is None:
+                title = 'None'
+        except Exception as e:
+            title = 'None'
+            log.warning(f'获取文件名时出错,已重命名为:"{title}",{_t(KeyWord.REASON)}:"{e}"')
+        return title
+
+    def __new_video_title(self, media_object) -> str:
+        return self.__safe_text_filename(
             getattr(self.message, 'text', None) or
             getattr(self.message, 'caption', None) or
             getattr(self.message, 'link', None)
+        ) or self.__legacy_video_title(media_object)
+
+    def __select_video_filename(self, old_filename: str, new_filename: str) -> str:
+        if self.video_filename_mode == 'old':
+            return old_filename
+        if self.video_filename_mode == 'new':
+            return new_filename
+        default_filename = new_filename if self.video_filename_default_mode == 'new' else old_filename
+        if old_filename == new_filename or self.video_filename_prompt_timeout <= 0:
+            return default_filename
+        prompt = (
+            '\n请选择视频文件命名逻辑:\n'
+            f'1. 新逻辑: {new_filename}\n'
+            f'2. 旧逻辑: {old_filename}\n'
+            f'默认({self.video_filename_prompt_timeout}秒后自动选择): {self.video_filename_default_mode}\n'
+            '请输入 1/new 或 2/old 后回车: '
         )
-        try:
-            if title is None:
-                title = getattr(media_object, 'file_name', None)  # v1.2.8 修复当文件名不存在时,下载报错问题。
-                if isinstance(title, str):
-                    if title.lower().startswith('video_'):  # v1.5.6 尝试修复以日期命名的标题重复下载的问题。
-                        title = None
-                    else:
-                        title: str = os.path.splitext(title)[0]
-            if title is None:
-                title: str = 'None'
-        except Exception as e:
-            title: str = 'None'
-            log.warning(f'获取文件名时出错,已重命名为:"{title}",{_t(KeyWord.REASON)}:"{e}"')
-        return '{} - {}.{}'.format(
-            getattr(self.message, 'id', '0'),
-            title,
-            get_extension(
-                file_id=media_object.file_id,
-                mime_type=getattr(media_object, 'mime_type', default_mtype),
-                dot=False
-            )
+        choice = self.__timed_input(prompt, self.video_filename_prompt_timeout).strip().lower()
+        if choice in ('2', 'old', 'o', '旧'):
+            return old_filename
+        if choice in ('1', 'new', 'n', '新'):
+            return new_filename
+        return default_filename
+
+    def get_video_filename_candidates(self) -> dict:
+        default_mtype: str = 'video/mp4'
+        media_object = getattr(self.message, self.download_type)
+        extension = get_extension(
+            file_id=media_object.file_id,
+            mime_type=getattr(media_object, 'mime_type', default_mtype),
+            dot=False
         )
+        message_id = getattr(self.message, 'id', '0')
+        return {
+            'old': self.__format_video_filename(message_id, self.__legacy_video_title(media_object), extension),
+            'new': self.__format_video_filename(message_id, self.__new_video_title(media_object), extension)
+        }
+
+    def get_video_filename(self):
+        """处理视频文件的文件名。"""
+        candidates = self.get_video_filename_candidates()
+        return self.__select_video_filename(old_filename=candidates.get('old'), new_filename=candidates.get('new'))
 
     def get_photo_filename(self):
         """处理图片文件的文件名。"""

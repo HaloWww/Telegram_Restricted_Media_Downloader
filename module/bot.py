@@ -67,6 +67,7 @@ class Bot:
     COMMANDS: List[BotCommand] = [
         BotCommand(BotCommandText.HELP[0], BotCommandText.HELP[1]),
         BotCommand(BotCommandText.DOWNLOAD[0], BotCommandText.DOWNLOAD[1].replace('`', '')),
+        BotCommand(BotCommandText.TASKS[0], BotCommandText.TASKS[1].replace('`', '')),
         BotCommand(BotCommandText.TABLE[0], BotCommandText.TABLE[1]),
         BotCommand(BotCommandText.FORWARD[0], BotCommandText.FORWARD[1].replace('`', '')),
         BotCommand(BotCommandText.EXIT[0], BotCommandText.EXIT[1]),
@@ -470,6 +471,10 @@ class Bot:
                 ],
                 [
                     InlineKeyboardButton(
+                        BotButton.DOWNLOAD_TASKS,
+                        callback_data=BotCallbackText.DOWNLOAD_TASKS
+                    ),
+                    InlineKeyboardButton(
                         BotButton.SETTING,
                         callback_data=BotCallbackText.SETTING
                     )
@@ -484,6 +489,7 @@ class Bot:
             f'🎮️ 可用命令:\n'
             f'🛎️ {BotCommandText.with_description(BotCommandText.HELP)}\n'
             f'📁 {BotCommandText.with_description(BotCommandText.DOWNLOAD)}\n'
+            f'📥 {BotCommandText.with_description(BotCommandText.TASKS)}\n'
             f'📝 {BotCommandText.with_description(BotCommandText.TABLE)}\n'
             f'↗️ {BotCommandText.with_description(BotCommandText.FORWARD)}\n'
             f'❌ {BotCommandText.with_description(BotCommandText.EXIT)}\n'
@@ -1017,6 +1023,12 @@ class Bot:
                 MessageHandler(
                     self.get_download_link_from_bot,
                     filters=pyrogram.filters.command(['download']) & pyrogram.filters.user(self.root)
+                )
+            )
+            self.bot.add_handler(
+                MessageHandler(
+                    self.download_tasks,
+                    filters=pyrogram.filters.command(['tasks']) & pyrogram.filters.user(self.root)
                 )
             )
             self.bot.add_handler(

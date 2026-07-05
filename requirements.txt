@@ -1,4 +1,3 @@
-tgcrypto
 PyYAML
 rich==14.2.0
 qrcode

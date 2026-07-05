@@ -144,6 +144,8 @@ max_retries:
   download: 5 # 最大的下载任务的重试次数。
   upload: 3 # 最大的上传任务的重试次数。
 memory_download_limit: 0 # 内存下载容量上限(MB),0表示关闭;小于等于该大小的文件优先直接在内存中下载。
+video_filename_default_mode: new # 视频命名选择超时后的默认逻辑。支持:new,old。
+video_filename_prompt_timeout: 5 # 视频命名选择等待秒数,0表示不等待并直接使用默认逻辑。
 max_tasks:
   download: 5 # 最大同时下载的任务数。
   upload: 3 # 最大同时上传的任务数。
