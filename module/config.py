@@ -153,6 +153,7 @@ class UserConfig(BaseConfig):
         'links': None,
         'save_directory': None,  # v1.3.0 将配置文件中save_path的参数名修改为save_directory。
         'temp_directory': None,
+        'memory_download_limit': 0,  # 内存下载容量上限(MB),0为关闭。
         'max_tasks': {
             'download': None,
             'upload': None
@@ -202,6 +203,17 @@ class UserConfig(BaseConfig):
         self.work_directory: str = PARSE_ARGS.session or (
                 self.config.get('session_directory') or UserConfig.WORK_DIRECTORY)
         self.temp_directory: str = PARSE_ARGS.temp or (self.config.get('temp_directory') or UserConfig.TEMP_DIRECTORY)
+        self.memory_download_limit: int = self.normalize_memory_download_limit(
+            self.config.get('memory_download_limit'))
+        self.memory_download_limit_bytes: int = self.memory_download_limit * 1024 * 1024
+
+    @staticmethod
+    def normalize_memory_download_limit(value) -> int:
+        """规范化内存下载容量上限(MB),0表示关闭。"""
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def get_last_history_record(self) -> None:
         """获取最近一次保存的历史配置文件。"""
@@ -395,6 +407,8 @@ class UserConfig(BaseConfig):
                 'download')
             _download_type: Union[list, None] = pre_load_config.get('download_type')
             _is_shutdown: Union[bool, None] = pre_load_config.get('is_shutdown')
+            _memory_download_limit: int = self.normalize_memory_download_limit(
+                pre_load_config.get('memory_download_limit'))
             _proxy_config: dict = pre_load_config.get('proxy', {})
             _enable_proxy: Union[str, bool] = _proxy_config.get('enable_proxy', False)
             _proxy_scheme: Union[str, bool] = _proxy_config.get('scheme', False)
@@ -565,6 +579,8 @@ class UserConfig(BaseConfig):
             pre_load_config['temp_directory'] = _temp_directory
         else:
             pre_load_config['temp_directory'] = PARSE_ARGS.temp
+        pre_load_config['memory_download_limit'] = self.normalize_memory_download_limit(
+            PARSE_ARGS.memory if PARSE_ARGS.memory is not None else _memory_download_limit)
         self.save_config(pre_load_config)  # v1.3.0 修复不保存配置文件时,配置文件仍然保存的问题。
 
     def save_config(self, config: dict) -> None:

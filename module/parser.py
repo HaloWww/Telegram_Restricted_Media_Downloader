@@ -65,6 +65,13 @@ class TelegramRestrictedMediaDownloaderArgumentParser(ArgumentParser):
             help='设置运行缓存的路径'
         )
         self.add_argument(
+            '--memory', '--memory-limit',
+            type=int,
+            required=False,
+            default=None,
+            help='设置内存下载容量上限(MB),0为关闭'
+        )
+        self.add_argument(
             '-w', '--web',
             type=int,
             nargs='?',

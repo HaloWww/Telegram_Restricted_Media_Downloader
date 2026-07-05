@@ -4,6 +4,7 @@
 # Time:2024/7/25 12:32
 # File:app.py
 import os
+import re
 import time
 import datetime
 import subprocess
@@ -228,19 +229,35 @@ class DownloadFileName:
         self.message = message
         self.download_type = download_type
 
+    @staticmethod
+    def __safe_text_filename(text: Union[str, None]) -> Union[str, None]:
+        if not text:
+            return None
+        text = text.strip()
+        if not text:
+            return None
+        text = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]+', '-', text)
+        return text.strip(' .-') or None
+
     def get_video_filename(self):
         """处理视频文件的文件名。"""
         default_mtype: str = 'video/mp4'  # v1.2.8 健全获取文件名逻辑。
         media_object = getattr(self.message, self.download_type)
-        title: Union[str, None] = getattr(media_object, 'file_name', None)  # v1.2.8 修复当文件名不存在时,下载报错问题。
+        title: Union[str, None] = self.__safe_text_filename(
+            getattr(self.message, 'text', None) or
+            getattr(self.message, 'caption', None) or
+            getattr(self.message, 'link', None)
+        )
         try:
-            if isinstance(title, str):
-                if title.lower().startswith('video_'):  # v1.5.6 尝试修复以日期命名的标题重复下载的问题。
-                    title = None
+            if title is None:
+                title = getattr(media_object, 'file_name', None)  # v1.2.8 修复当文件名不存在时,下载报错问题。
+                if isinstance(title, str):
+                    if title.lower().startswith('video_'):  # v1.5.6 尝试修复以日期命名的标题重复下载的问题。
+                        title = None
+                    else:
+                        title: str = os.path.splitext(title)[0]
             if title is None:
                 title: str = 'None'
-            else:
-                title: str = os.path.splitext(title)[0]
         except Exception as e:
             title: str = 'None'
             log.warning(f'获取文件名时出错,已重命名为:"{title}",{_t(KeyWord.REASON)}:"{e}"')

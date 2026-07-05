@@ -349,6 +349,8 @@ def get_subprocess_args(main_file: str) -> list:
         args.extend(['--session', PARSE_ARGS.session])
     if PARSE_ARGS.temp:
         args.extend(['--temp', PARSE_ARGS.temp])
+    if PARSE_ARGS.memory is not None:
+        args.extend(['--memory', str(PARSE_ARGS.memory)])
 
     return args
 

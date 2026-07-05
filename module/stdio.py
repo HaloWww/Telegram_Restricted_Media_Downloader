@@ -436,6 +436,7 @@ class StatisticalTable:
                 'user_config_path': app.config_path,
                 'session_directory': app.work_directory,
                 'temp_directory': app.temp_directory,
+                'memory_download_limit': app.memory_download_limit,
                 'enable_proxy': app.enable_proxy
             }
         )
@@ -451,6 +452,7 @@ class StatisticalTable:
                 ['保存目录', app.save_directory],
                 ['会话目录', app.work_directory],
                 ['缓存目录', app.temp_directory],
+                ['内存下载上限(MB)', app.memory_download_limit],
                 ['使用系统代理', app.enable_proxy]
             ],
             show_lines=True

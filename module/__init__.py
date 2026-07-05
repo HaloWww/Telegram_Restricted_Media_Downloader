@@ -143,6 +143,7 @@ links: D:\path\where\your\link\files\save\content.txt # 链接地址写法如下
 max_retries:
   download: 5 # 最大的下载任务的重试次数。
   upload: 3 # 最大的上传任务的重试次数。
+memory_download_limit: 0 # 内存下载容量上限(MB),0表示关闭;小于等于该大小的文件优先直接在内存中下载。
 max_tasks:
   download: 5 # 最大同时下载的任务数。
   upload: 3 # 最大同时上传的任务数。

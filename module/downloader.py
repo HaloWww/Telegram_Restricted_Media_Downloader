@@ -110,6 +110,8 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.event: asyncio.Event = asyncio.Event()
         self.queue: asyncio.Queue = asyncio.Queue()
         self.app: Application = Application()
+        self.memory_download_lock: asyncio.Lock = asyncio.Lock()
+        self.memory_download_used: int = 0
         self.is_running: bool = False
         self.running_log: Set[bool] = set()
         self.running_log.add(self.is_running)
@@ -117,6 +119,20 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.uploader: Union[TelegramUploader, None] = None
         self.cd: Union[CallbackData, None] = None
         self.my_id: int = 0
+
+    async def __reserve_memory_download(self, file_size: int) -> bool:
+        """为内存下载预留容量,容量不足时回退到磁盘缓存。"""
+        memory_limit = self.app.memory_download_limit_bytes
+        if memory_limit <= 0 or file_size > memory_limit:
+            return False
+        async with self.memory_download_lock:
+            if self.memory_download_used + file_size > memory_limit:
+                return False
+            self.memory_download_used += file_size
+            return True
+
+    def __release_memory_download(self, file_size: int) -> None:
+        self.memory_download_used = max(0, self.memory_download_used - file_size)
 
     def env_save_directory(
             self,
@@ -260,11 +276,6 @@ class TelegramRestrictedMediaDownloader(Bot):
         if self.gc.config.get(BotCallbackText.NOTICE):
             chat_id = message.from_user.id
             await asyncio.gather(
-                self.__send_pay_qr(
-                    client=client,
-                    chat_id=chat_id,
-                    load_name='机器人'
-                ),
                 super().start(client, message),
                 client.send_message(
                     chat_id=chat_id,
@@ -1626,6 +1637,63 @@ class TelegramRestrictedMediaDownloader(Bot):
                 f'"{temp_path}"下载完成,更改文件名:[{temp_path}]({get_file_size(temp_path)}) -> [{file_name}]({compare_size})')
         return file_name
 
+    async def memory_download(
+            self,
+            message: pyrogram.types.Message,
+            save_file_path: str,
+            progress: Callable = None,
+            progress_args: tuple = (),
+            chunk_size: int = 1024 * 1024,
+            compare_size: Union[int, None] = None
+    ) -> Union[str, None]:
+        """将小文件下载到内存,完成后一次性写入最终保存目录。"""
+        downloaded: int = 0
+        skip_chunks: int = 0
+        buffer = bytearray()
+        while True:
+            try:
+                async for chunk in self.app.client.stream_media(message=message, offset=skip_chunks):
+                    if self.app.memory_download_limit_bytes and downloaded + len(chunk) > self.app.memory_download_limit_bytes:
+                        log.warning(f'内存下载超过上限:{self.app.memory_download_limit}MB,已取消本次内存下载。')
+                        return None
+                    downloaded += len(chunk)
+                    buffer.extend(chunk)
+                    if progress:
+                        progress(downloaded, *progress_args)
+                break
+            except FileReferenceExpired as e:
+                log.warning(f'文件引用已过期,正在重新获取消息以刷新引用,{_t(KeyWord.REASON)}:"{e}"')
+                try:
+                    message = await self.app.client.get_messages(chat_id=message.chat.id, message_ids=message.id)
+                    skip_chunks = downloaded // chunk_size
+                except Exception as refresh_error:
+                    log.error(f'重新获取消息失败,{_t(KeyWord.REASON)}:"{refresh_error}"')
+                    return None
+            except (FloodWait, FloodPremiumWait) as e:
+                amount = e.value
+                console.log(
+                    f'[{self.app.client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
+                    style='#FF4689'
+                )
+                await asyncio.sleep(amount)
+        if compare_size is not None and not compare_file_size(a_size=downloaded, b_size=compare_size):
+            return None
+        save_parent: str = split_path(save_file_path).get('directory') or os.getcwd()
+        try:
+            os.makedirs(save_parent, exist_ok=True)
+            if os.path.exists(save_file_path):
+                if compare_size is not None and compare_file_size(get_file_size(save_file_path), compare_size):
+                    return save_file_path
+                log.warning(f'"{save_file_path}"已存在且大小不一致,内存下载结果未写入。')
+                return None
+            with open(file=save_file_path, mode='xb') as f:
+                f.write(buffer)
+            log.info(f'内存下载完成,已写入:"{save_file_path}"({downloaded})。')
+            return save_file_path
+        except Exception as e:
+            log.error(f'内存下载写入"{save_file_path}"失败,{_t(KeyWord.REASON)}:"{e}"')
+            return None
+
     def get_media_meta(self, message: pyrogram.types.Message, dtype) -> Dict[str, Union[int, str]]:
         """获取媒体元数据。"""
         file_id: int = getattr(message, 'id')
@@ -1703,6 +1771,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                         _future=save_directory
                     )
                 else:
+                    memory_download: bool = await self.__reserve_memory_download(sever_file_size)
                     console.log(
                         f'{_t(KeyWord.DOWNLOAD_TASK)}'
                         f'{_t(KeyWord.FILE)}:"{file_name}",'
@@ -1716,19 +1785,30 @@ class TelegramRestrictedMediaDownloader(Bot):
                         info=f'0.00B/{format_file_size}',
                         total=sever_file_size
                     )
+                    download_func: Callable = self.memory_download if memory_download else self.resume_download
+                    download_kwargs: dict = {
+                        'message': message,
+                        'progress': self.pb.download,
+                        'progress_args': (
+                            sever_file_size,
+                            self.pb.progress,
+                            task_id
+                        ),
+                        'compare_size': sever_file_size
+                    }
+                    if memory_download:
+                        download_kwargs['save_file_path'] = save_directory
+                    else:
+                        download_kwargs['file_name'] = temp_file_path
                     _task = self.loop.create_task(
-                        self.resume_download(
-                            message=message,
-                            file_name=temp_file_path,
-                            progress=self.pb.download,
-                            progress_args=(
-                                sever_file_size,
-                                self.pb.progress,
-                                task_id
-                            ),
-                            compare_size=sever_file_size
+                        download_func(
+                            **download_kwargs
                         )
                     )
+                    if memory_download:
+                        log.info(
+                            f'启用内存下载:"{file_name}",大小:{format_file_size},'
+                            f'内存上限:{self.app.memory_download_limit}MB。')
                     MetaData.print_current_task_num(
                         prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
                         num=self.app.current_task_num
@@ -1746,7 +1826,8 @@ class TelegramRestrictedMediaDownloader(Bot):
                             format_file_size,
                             task_id,
                             with_upload,
-                            diy_download_type
+                            diy_download_type,
+                            memory_download=memory_download
                         )
                     )
             else:
@@ -1831,7 +1912,8 @@ class TelegramRestrictedMediaDownloader(Bot):
             task_id,
             with_upload,
             diy_download_type,
-            _future
+            _future,
+            memory_download: bool = False
     ):
         if task_id is None:
             if retry_count == 0:
@@ -1862,13 +1944,46 @@ class TelegramRestrictedMediaDownloader(Bot):
         else:
             self.app.current_task_num -= 1
             self.event.set()  # v1.3.4 修复重试下载被阻塞的问题。
-            if self.__check_download_finish(
-                    message=message,
-                    sever_file_size=sever_file_size,
-                    temp_file_path=temp_file_path,
-                    save_directory=self.env_save_directory(message),
-                    with_move=True
-            ):
+            downloaded_file_path: str = os.path.join(self.env_save_directory(message), file_name)
+            if memory_download:
+                self.__release_memory_download(sever_file_size)
+                if _future.cancelled():
+                    downloaded_file_path = ''
+                else:
+                    try:
+                        downloaded_file_path = _future.result()
+                    except Exception as e:
+                        downloaded_file_path = ''
+                        log.error(f'内存下载任务失败,{_t(KeyWord.REASON)}:"{e}"')
+                download_success: bool = bool(downloaded_file_path) and is_file_duplicate(
+                    save_directory=downloaded_file_path,
+                    sever_file_size=sever_file_size
+                )
+                if download_success:
+                    console.log(
+                        f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                        f'{_t(KeyWord.FILE)}:"{downloaded_file_path}",'
+                        f'{_t(KeyWord.SIZE)}:{format_file_size},'
+                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, downloaded_file_path, DownloadStatus.SUCCESS))},'
+                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SUCCESS)}。'
+                    )
+                else:
+                    console.log(
+                        f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                        f'{_t(KeyWord.FILE)}:"{os.path.join(self.env_save_directory(message), file_name)}",'
+                        f'{_t(KeyWord.ACTUAL_SIZE)}:{format_file_size},'
+                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.FAILURE))},'
+                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.FAILURE)}。'
+                    )
+            else:
+                download_success: bool = self.__check_download_finish(
+                        message=message,
+                        sever_file_size=sever_file_size,
+                        temp_file_path=temp_file_path,
+                        save_directory=self.env_save_directory(message),
+                        with_move=True
+                )
+            if download_success:
                 MetaData.print_current_task_num(
                     prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
                     num=self.app.current_task_num
@@ -1883,7 +1998,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                         with_upload['media_group'] = media_group
                         self.uploader.download_upload(
                             with_upload=with_upload,
-                            file_path=os.path.join(self.env_save_directory(message), file_name)
+                            file_path=downloaded_file_path
                         )
                 self.queue.task_done()
             else:
