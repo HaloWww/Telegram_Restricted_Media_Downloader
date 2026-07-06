@@ -118,6 +118,9 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.active_download_task_counter: int = 0
         self.active_download_tasks: Dict[str, dict] = {}
         self.active_download_task_ids: Dict[asyncio.Task, str] = {}
+        self.pending_download_tasks: Dict[str, dict] = {}
+        self.cancelled_download_task_ids: Set[str] = set()
+        self.download_task_semaphore: asyncio.Semaphore = asyncio.Semaphore(self.app.max_download_task)
         self.is_running: bool = False
         self.running_log: Set[bool] = set()
         self.running_log.add(self.is_running)
@@ -137,6 +140,16 @@ class TelegramRestrictedMediaDownloader(Bot):
             if task_meta.get('task') and not task_meta.get('task').done()
         ]
 
+    def __get_pending_download_tasks(self) -> list:
+        return [
+            (task_id, task_meta)
+            for task_id, task_meta in sorted(self.pending_download_tasks.items(), key=lambda item: int(item[0]))
+            if not task_meta.get('cancel_requested')
+        ]
+
+    def __is_tracked_download_cancelled(self, task_id: Union[str, None]) -> bool:
+        return bool(task_id and task_id in self.cancelled_download_task_ids)
+
     @staticmethod
     def __short_text(text: str, max_length: int = 120) -> str:
         text = str(text or '')
@@ -154,8 +167,26 @@ class TelegramRestrictedMediaDownloader(Bot):
             f'链接:{self.__short_text(task_meta.get("link"), 120)}'
         )
 
+    def __format_pending_download_task(self, task_id: str, task_meta: dict) -> str:
+        text = f'#{task_id} {task_meta.get("status", "等待中")}\n'
+        if task_meta.get('file_name'):
+            text += f'文件:{self.__short_text(task_meta.get("file_name"), 80)}\n'
+        if task_meta.get('file_size'):
+            text += f'大小:{MetaData.suitable_units_display(task_meta.get("file_size"))}\n'
+        text += f'链接:{self.__short_text(task_meta.get("link"), 120)}'
+        return text
+
     def __download_task_list_keyboard(self) -> InlineKeyboardMarkup:
         keyboard = []
+        for task_id, task_meta in self.__get_pending_download_tasks():
+            if task_meta.get('cancel_requested'):
+                continue
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f'{BotButton.CANCEL_TASK} #{task_id}',
+                    callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:{task_id}'
+                )
+            ])
         for task_id, task_meta in self.__get_active_download_tasks():
             if task_meta.get('cancel_requested'):
                 continue
@@ -172,14 +203,20 @@ class TelegramRestrictedMediaDownloader(Bot):
         return InlineKeyboardMarkup(keyboard)
 
     async def __show_active_download_tasks(self, callback_query: pyrogram.types.CallbackQuery) -> None:
+        pending_tasks = self.__get_pending_download_tasks()
         active_tasks = self.__get_active_download_tasks()
+        text_parts = []
+        if pending_tasks:
+            text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
+                self.__format_pending_download_task(task_id, task_meta)
+                for task_id, task_meta in pending_tasks
+            ))
         if active_tasks:
-            text = '📥当前下载任务:\n\n' + '\n\n'.join(
+            text_parts.append('📥正在下载:\n\n' + '\n\n'.join(
                 self.__format_active_download_task(task_id, task_meta)
                 for task_id, task_meta in active_tasks
-            )
-        else:
-            text = '📥当前没有正在下载的任务。'
+            ))
+        text = '\n\n'.join(text_parts) if text_parts else '📥当前没有正在下载的任务。'
         try:
             await callback_query.message.edit_text(
                 text=safe_message(text)[0],
@@ -196,6 +233,11 @@ class TelegramRestrictedMediaDownloader(Bot):
     ) -> None:
         task_meta = self.active_download_tasks.get(task_id)
         task = task_meta.get('task') if task_meta else None
+        if not task_meta:
+            task_meta = self.pending_download_tasks.get(task_id)
+            if task_meta:
+                await self.__confirm_cancel_pending_download_task(callback_query, task_id, task_meta)
+                return None
         if not task or task.done():
             try:
                 await callback_query.message.edit_text(
@@ -226,6 +268,32 @@ class TelegramRestrictedMediaDownloader(Bot):
         except MessageNotModified:
             pass
 
+    async def __confirm_cancel_pending_download_task(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            task_id: str,
+            task_meta: dict
+    ) -> None:
+        try:
+            await callback_query.message.edit_text(
+                text=f'确认取消以下等待任务吗?\n\n{self.__format_pending_download_task(task_id, task_meta)}',
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            text=BotButton.OK,
+                            callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL_CONFIRM}:{task_id}'
+                        ),
+                        InlineKeyboardButton(
+                            text=BotButton.CANCEL,
+                            callback_data=BotCallbackText.DOWNLOAD_TASKS
+                        )
+                    ]
+                ]),
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+        except MessageNotModified:
+            pass
+
     async def __cancel_active_download_task(
             self,
             callback_query: pyrogram.types.CallbackQuery,
@@ -233,6 +301,21 @@ class TelegramRestrictedMediaDownloader(Bot):
     ) -> None:
         task_meta = self.active_download_tasks.get(task_id)
         task = task_meta.get('task') if task_meta else None
+        if not task_meta:
+            task_meta = self.pending_download_tasks.pop(task_id, None)
+            if task_meta:
+                task_meta['cancel_requested'] = True
+                self.cancelled_download_task_ids.add(task_id)
+                self.bot_task_link.discard(task_meta.get('link'))
+                try:
+                    await callback_query.message.edit_text(
+                        text=f'已取消等待任务:\n\n{self.__format_pending_download_task(task_id, task_meta)}',
+                        reply_markup=self.__download_task_list_keyboard(),
+                        link_preview_options=LINK_PREVIEW_OPTIONS
+                    )
+                except MessageNotModified:
+                    pass
+                return None
         if not task or task.done():
             try:
                 await callback_query.message.edit_text(
@@ -440,9 +523,9 @@ class TelegramRestrictedMediaDownloader(Bot):
                 with_upload=with_upload
             )
         else:
-            self.loop.create_task(
-                self.__create_download_tasks_from_bot(
-                    links=links,
+            for link in sorted(links):
+                self.__enqueue_download_task_from_bot(
+                    link=link,
                     invalid_link=invalid_link,
                     right_link=right_link,
                     exist_link=exist_link,
@@ -450,7 +533,70 @@ class TelegramRestrictedMediaDownloader(Bot):
                     message=message,
                     last_bot_message=last_bot_message
                 )
+
+    def __enqueue_download_task_from_bot(
+            self,
+            link: str,
+            invalid_link: set,
+            right_link: set,
+            exist_link: set,
+            client: pyrogram.Client,
+            message: pyrogram.types.Message,
+            last_bot_message: Union[pyrogram.types.Message, None]
+    ) -> None:
+        task_id = self.__next_active_download_task_id()
+        self.pending_download_tasks[task_id] = {
+            'link': link,
+            'status': '等待中',
+            'cancel_requested': False
+        }
+        self.bot_task_link.add(link)
+        self.loop.create_task(
+            self.__run_queued_download_task(
+                task_id=task_id,
+                link=link,
+                invalid_link=invalid_link,
+                right_link=right_link,
+                exist_link=exist_link,
+                client=client,
+                message=message,
+                last_bot_message=last_bot_message
             )
+        )
+
+    async def __run_queued_download_task(
+            self,
+            task_id: str,
+            link: str,
+            invalid_link: set,
+            right_link: set,
+            exist_link: set,
+            client: pyrogram.Client,
+            message: pyrogram.types.Message,
+            last_bot_message: Union[pyrogram.types.Message, None]
+    ) -> None:
+        task_meta = self.pending_download_tasks.get(task_id)
+        if not task_meta or task_meta.get('cancel_requested') or self.__is_tracked_download_cancelled(task_id):
+            self.cancelled_download_task_ids.discard(task_id)
+            return None
+        task_meta['status'] = '准备中'
+        try:
+            await self.__create_download_tasks_from_bot(
+                links={link},
+                invalid_link=invalid_link,
+                right_link=right_link,
+                exist_link=exist_link,
+                client=client,
+                message=message,
+                last_bot_message=last_bot_message,
+                track_task_id=task_id
+            )
+        except Exception as e:
+            log.exception(f'后台分配下载任务失败,{_t(KeyWord.REASON)}:"{e}"')
+            self.bot_task_link.discard(link)
+        finally:
+            self.pending_download_tasks.pop(task_id, None)
+            self.cancelled_download_task_ids.discard(task_id)
 
     async def __create_download_tasks_from_bot(
             self,
@@ -461,18 +607,23 @@ class TelegramRestrictedMediaDownloader(Bot):
             client: pyrogram.Client,
             message: pyrogram.types.Message,
             last_bot_message: Union[pyrogram.types.Message, None],
-            with_upload: Union[dict, None] = None
+            with_upload: Union[dict, None] = None,
+            track_task_id: Union[str, None] = None
     ) -> None:
         for link in links:
-            if not with_upload:
+            if not with_upload and not track_task_id:
                 self.bot_task_link.add(link)
             task: dict = await self.create_download_task(
                 message_ids=link,
                 retry=None,
                 with_upload=with_upload,
                 request_client=client,
-                request_message=message
+                request_message=message,
+                track_task_id=track_task_id
             )
+            if self.__is_tracked_download_cancelled(track_task_id):
+                self.bot_task_link.discard(link)
+                continue
             if task.get('status') == DownloadStatus.FAILURE:
                 invalid_link.add(link)
                 self.bot_task_link.discard(link)
@@ -567,14 +718,20 @@ class TelegramRestrictedMediaDownloader(Bot):
             client: pyrogram.Client,
             message: pyrogram.types.Message
     ) -> None:
+        pending_tasks = self.__get_pending_download_tasks()
         active_tasks = self.__get_active_download_tasks()
+        text_parts = []
+        if pending_tasks:
+            text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
+                self.__format_pending_download_task(task_id, task_meta)
+                for task_id, task_meta in pending_tasks
+            ))
         if active_tasks:
-            text = '📥当前下载任务:\n\n' + '\n\n'.join(
+            text_parts.append('📥正在下载:\n\n' + '\n\n'.join(
                 self.__format_active_download_task(task_id, task_meta)
                 for task_id, task_meta in active_tasks
-            )
-        else:
-            text = '📥当前没有正在下载的任务。'
+            ))
+        text = '\n\n'.join(text_parts) if text_parts else '📥当前没有正在下载的任务。'
         await client.send_message(
             chat_id=message.from_user.id,
             reply_parameters=ReplyParameters(message_id=message.id),
@@ -2057,22 +2214,26 @@ class TelegramRestrictedMediaDownloader(Bot):
             with_upload: Optional[dict] = None,
             diy_download_type: Optional[list] = None,
             request_client: Optional[pyrogram.Client] = None,
-            request_message: Optional[pyrogram.types.Message] = None
+            request_message: Optional[pyrogram.types.Message] = None,
+            track_task_id: Union[str, None] = None
     ) -> None:
         retry_count = retry.get('count')
         retry_id = retry.get('id')
+        if self.__is_tracked_download_cancelled(track_task_id):
+            return None
         if isinstance(message, list):
-            for _message in message:
+            for index, _message in enumerate(message):
+                child_track_task_id = track_task_id if index == 0 else None
                 if retry_count != 0:
                     if _message.id == retry_id:
                         await self.__add_task(
                             chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                            request_client, request_message)
+                            request_client, request_message, track_task_id)
                         break
                 else:
                     await self.__add_task(
                         chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                        request_client, request_message)
+                        request_client, request_message, child_track_task_id)
         else:
             _task = None
             valid_dtype: str = next((_ for _ in DownloadType() if getattr(message, _, None)), None)  # 判断该链接是否为有支持的类型。
@@ -2085,9 +2246,8 @@ class TelegramRestrictedMediaDownloader(Bot):
                     f'{_t(KeyWord.LINK)}:"{link}",'  # 链接。
                     f'{_t(KeyWord.LINK_TYPE)}:{_t(link_type)}。'  # 链接类型。
                 )
-                while self.app.current_task_num >= self.app.max_download_task:  # v1.0.7 增加下载任务数限制。
-                    await self.event.wait()
-                    self.event.clear()
+                if track_task_id in self.pending_download_tasks:
+                    self.pending_download_tasks[track_task_id]['status'] = '准备命名'
                 video_filename_mode = retry.get('video_filename_mode')
                 if video_filename_mode not in ('new', 'old'):
                     video_filename_mode = await self.__choose_video_filename_mode(
@@ -2103,6 +2263,18 @@ class TelegramRestrictedMediaDownloader(Bot):
                         dtype=valid_dtype,
                         video_filename_mode=video_filename_mode).values()
                 retry['id'] = file_id
+                if track_task_id in self.pending_download_tasks:
+                    self.pending_download_tasks[track_task_id].update(
+                        {
+                            'status': '等待空位',
+                            'file_name': file_name,
+                            'file_size': sever_file_size,
+                            'total': sever_file_size,
+                            'downloaded': 0
+                        }
+                    )
+                if self.__is_tracked_download_cancelled(track_task_id):
+                    return None
                 if is_file_duplicate(
                         save_directory=save_directory,
                         sever_file_size=sever_file_size
@@ -2122,6 +2294,10 @@ class TelegramRestrictedMediaDownloader(Bot):
                         _future=save_directory
                     )
                 else:
+                    await self.download_task_semaphore.acquire()
+                    if self.__is_tracked_download_cancelled(track_task_id):
+                        self.download_task_semaphore.release()
+                        return None
                     memory_download: bool = await self.__reserve_memory_download(sever_file_size)
                     console.log(
                         f'{_t(KeyWord.DOWNLOAD_TASK)}'
@@ -2136,7 +2312,8 @@ class TelegramRestrictedMediaDownloader(Bot):
                         info=f'0.00B/{format_file_size}',
                         total=sever_file_size
                     )
-                    active_task_id = self.__next_active_download_task_id()
+                    active_task_id = track_task_id or self.__next_active_download_task_id()
+                    self.pending_download_tasks.pop(active_task_id, None)
                     self.active_download_tasks[active_task_id] = {
                         'task': None,
                         'link': link,
@@ -2312,6 +2489,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                             file_path=os.path.join(self.env_save_directory(message), file_name)
                         )
         else:
+            self.download_task_semaphore.release()
             self.app.current_task_num = max(0, self.app.current_task_num - 1)
             self.event.set()  # v1.3.4 修复重试下载被阻塞的问题。
             active_task_meta = self.active_download_tasks.get(active_task_id)
@@ -2675,7 +2853,8 @@ class TelegramRestrictedMediaDownloader(Bot):
             with_upload: Union[dict, None] = None,
             diy_download_type: Optional[list] = None,
             request_client: Optional[pyrogram.Client] = None,
-            request_message: Optional[pyrogram.types.Message] = None
+            request_message: Optional[pyrogram.types.Message] = None,
+            track_task_id: Union[str, None] = None
     ) -> dict:
         retry = retry if retry else {'id': -1, 'count': 0}
         diy_download_type = [_ for _ in DownloadType()] if with_upload else diy_download_type
@@ -2702,7 +2881,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             DownloadTask.set(link, 'member_num', member_num)
             await self.__add_task(
                 chat_id, link_type, link, message, retry, with_upload, diy_download_type,
-                request_client, request_message)
+                request_client, request_message, track_task_id)
             return {
                 'chat_id': chat_id,
                 'member_num': member_num,
