@@ -128,6 +128,7 @@ api_hash: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx # 申请的api_hash。
 api_id: 'xxxxxxxx' # 申请的api_id。
 # bot_token（选填）如果不填，就不能使用机器人功能。可前往https://t.me/BotFather免费申请。
 bot_token: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+bot_allowed_users: [] # 允许使用机器人的额外用户ID列表,登录主账号始终允许使用。
 download_type: # 需要下载的类型。支持的参数:video,photo,document,audio,voice,animation。
 - video # 视频。
 - photo # 图片。
