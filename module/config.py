@@ -617,12 +617,14 @@ class UserConfig(BaseConfig):
             log.error(f'保存配置文件失败,{_t(KeyWord.REASON)}:"{e}"')
 
     def ctrl_c(self):
+        if not sys.stdin or not sys.stdin.isatty():
+            return None
         if self.platform == 'Windows':
             subprocess.run('pause', shell=True)
         else:
             try:
                 console.input('请按「Enter」键继续. . .')
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 pass
 
 
