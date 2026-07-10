@@ -1001,8 +1001,7 @@ class Bot:
             self.bot = bot_client_obj
             self.user = user_client_obj
             root = await self.user.get_me()
-            allowed_users = getattr(self.application, 'bot_allowed_users', []) or []
-            self.root = list(dict.fromkeys([root.id, *allowed_users]))
+            self.root.append(root.id)
             await bot_client_obj.start()
             await self.bot.set_bot_commands(self.COMMANDS)
             bot = await self.bot.get_me()
