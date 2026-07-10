@@ -73,6 +73,8 @@ class LinuxService:
             args.extend(['--temp', os.path.abspath(PARSE_ARGS.temp)])
         if PARSE_ARGS.memory is not None:
             args.extend(['--memory', str(PARSE_ARGS.memory)])
+        if PARSE_ARGS.debug_log:
+            args.extend(['--debug-log', os.path.abspath(PARSE_ARGS.debug_log)])
         if PARSE_ARGS.web is not None:
             web_port = PARSE_ARGS.web if PARSE_ARGS.web != 0 else self.service_port
             args.extend(['--web', str(web_port), '--mode', MODE.SESSION])

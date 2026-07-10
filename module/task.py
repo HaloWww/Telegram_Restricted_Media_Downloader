@@ -53,10 +53,12 @@ class DownloadTask:
     def on_create_task(func):
         @wraps(func)
         async def wrapper(self, *args, **kwargs):
-            message_ids = kwargs.get('message_ids')
+            message_ids = kwargs.get('message_ids') if 'message_ids' in kwargs else (args[0] if args else None)
             link = message_ids
             if isinstance(message_ids, pyrogram.types.Message):
-                link = message_ids.link if message_ids.link else message_ids.id
+                chat_id = getattr(getattr(message_ids, 'chat', None), 'id', None)
+                message_link = getattr(message_ids, 'link', None)
+                link = message_link if message_link else f'{chat_id}/{message_ids.id}'
             DownloadTask(link=link, link_type=None, member_num=0, complete_num=0, file_name=set(), error_msg={})
             res: dict = await func(self, *args, **kwargs)
             chat_id, link_type, member_num, status, e_code = res.values()
@@ -105,7 +107,7 @@ class DownloadTask:
                 )
                 DownloadTask.LINK_INFO.get(link)['error_msg'] = {}
                 DownloadTask.COMPLETE_LINK.add(link)
-                asyncio.create_task(self.done_notice(f'"{link}"下载完成。'))
+                asyncio.create_task(self.done_notice(f'"{link}"下载完成。', link=link))
             return res
 
         return wrapper

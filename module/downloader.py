@@ -133,22 +133,31 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.active_download_task_counter += 1
         return str(self.active_download_task_counter)
 
-    def __get_active_download_tasks(self) -> list:
+    def __get_active_download_tasks(self, request_user_id: Union[int, None] = None) -> list:
         return [
             (task_id, task_meta)
             for task_id, task_meta in sorted(self.active_download_tasks.items(), key=lambda item: int(item[0]))
-            if task_meta.get('task') and not task_meta.get('task').done()
+            if task_meta.get('task') and not task_meta.get('task').done() and self.__is_download_task_visible(
+                task_meta, request_user_id)
         ]
 
-    def __get_pending_download_tasks(self) -> list:
+    def __get_pending_download_tasks(self, request_user_id: Union[int, None] = None) -> list:
         return [
             (task_id, task_meta)
             for task_id, task_meta in sorted(self.pending_download_tasks.items(), key=lambda item: int(item[0]))
-            if not task_meta.get('cancel_requested')
+            if not task_meta.get('cancel_requested') and self.__is_download_task_visible(task_meta, request_user_id)
         ]
 
     def __is_tracked_download_cancelled(self, task_id: Union[str, None]) -> bool:
         return bool(task_id and task_id in self.cancelled_download_task_ids)
+
+    def __is_admin_user(self, user_id: Union[int, None]) -> bool:
+        return self.is_bot_admin_user(user_id)
+
+    def __is_download_task_visible(self, task_meta: dict, request_user_id: Union[int, None]) -> bool:
+        if request_user_id is None or self.__is_admin_user(request_user_id):
+            return True
+        return task_meta.get('request_user_id') == request_user_id
 
     @staticmethod
     def __short_text(text: str, max_length: int = 120) -> str:
@@ -176,9 +185,9 @@ class TelegramRestrictedMediaDownloader(Bot):
         text += f'链接:{self.__short_text(task_meta.get("link"), 120)}'
         return text
 
-    def __download_task_list_keyboard(self) -> InlineKeyboardMarkup:
+    def __download_task_list_keyboard(self, request_user_id: Union[int, None] = None) -> InlineKeyboardMarkup:
         keyboard = []
-        for task_id, task_meta in self.__get_pending_download_tasks():
+        for task_id, task_meta in self.__get_pending_download_tasks(request_user_id):
             if task_meta.get('cancel_requested'):
                 continue
             keyboard.append([
@@ -187,7 +196,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                     callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:{task_id}'
                 )
             ])
-        for task_id, task_meta in self.__get_active_download_tasks():
+        for task_id, task_meta in self.__get_active_download_tasks(request_user_id):
             if task_meta.get('cancel_requested'):
                 continue
             keyboard.append([
@@ -203,8 +212,9 @@ class TelegramRestrictedMediaDownloader(Bot):
         return InlineKeyboardMarkup(keyboard)
 
     async def __show_active_download_tasks(self, callback_query: pyrogram.types.CallbackQuery) -> None:
-        pending_tasks = self.__get_pending_download_tasks()
-        active_tasks = self.__get_active_download_tasks()
+        request_user_id = callback_query.from_user.id
+        pending_tasks = self.__get_pending_download_tasks(request_user_id)
+        active_tasks = self.__get_active_download_tasks(request_user_id)
         text_parts = []
         if pending_tasks:
             text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
@@ -220,7 +230,7 @@ class TelegramRestrictedMediaDownloader(Bot):
         try:
             await callback_query.message.edit_text(
                 text=safe_message(text)[0],
-                reply_markup=self.__download_task_list_keyboard(),
+                reply_markup=self.__download_task_list_keyboard(request_user_id),
                 link_preview_options=LINK_PREVIEW_OPTIONS
             )
         except MessageNotModified:
@@ -231,18 +241,33 @@ class TelegramRestrictedMediaDownloader(Bot):
             callback_query: pyrogram.types.CallbackQuery,
             task_id: str
     ) -> None:
+        request_user_id = callback_query.from_user.id
         task_meta = self.active_download_tasks.get(task_id)
         task = task_meta.get('task') if task_meta else None
+        if task_meta and not self.__is_download_task_visible(task_meta, request_user_id):
+            await callback_query.message.edit_text(
+                text='无权操作该下载任务。',
+                reply_markup=self.__download_task_list_keyboard(request_user_id),
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
         if not task_meta:
             task_meta = self.pending_download_tasks.get(task_id)
             if task_meta:
+                if not self.__is_download_task_visible(task_meta, request_user_id):
+                    await callback_query.message.edit_text(
+                        text='无权操作该等待任务。',
+                        reply_markup=self.__download_task_list_keyboard(request_user_id),
+                        link_preview_options=LINK_PREVIEW_OPTIONS
+                    )
+                    return None
                 await self.__confirm_cancel_pending_download_task(callback_query, task_id, task_meta)
                 return None
         if not task or task.done():
             try:
                 await callback_query.message.edit_text(
                     text='该下载任务不存在或已完成。',
-                    reply_markup=self.__download_task_list_keyboard(),
+                    reply_markup=self.__download_task_list_keyboard(request_user_id),
                     link_preview_options=LINK_PREVIEW_OPTIONS
                 )
             except MessageNotModified:
@@ -299,18 +324,34 @@ class TelegramRestrictedMediaDownloader(Bot):
             callback_query: pyrogram.types.CallbackQuery,
             task_id: str
     ) -> None:
+        request_user_id = callback_query.from_user.id
         task_meta = self.active_download_tasks.get(task_id)
         task = task_meta.get('task') if task_meta else None
+        if task_meta and not self.__is_download_task_visible(task_meta, request_user_id):
+            await callback_query.message.edit_text(
+                text='无权操作该下载任务。',
+                reply_markup=self.__download_task_list_keyboard(request_user_id),
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
         if not task_meta:
-            task_meta = self.pending_download_tasks.pop(task_id, None)
+            task_meta = self.pending_download_tasks.get(task_id)
             if task_meta:
+                if not self.__is_download_task_visible(task_meta, request_user_id):
+                    await callback_query.message.edit_text(
+                        text='无权操作该等待任务。',
+                        reply_markup=self.__download_task_list_keyboard(request_user_id),
+                        link_preview_options=LINK_PREVIEW_OPTIONS
+                    )
+                    return None
+                self.pending_download_tasks.pop(task_id, None)
                 task_meta['cancel_requested'] = True
                 self.cancelled_download_task_ids.add(task_id)
                 self.bot_task_link.discard(task_meta.get('link'))
                 try:
                     await callback_query.message.edit_text(
                         text=f'已取消等待任务:\n\n{self.__format_pending_download_task(task_id, task_meta)}',
-                        reply_markup=self.__download_task_list_keyboard(),
+                        reply_markup=self.__download_task_list_keyboard(request_user_id),
                         link_preview_options=LINK_PREVIEW_OPTIONS
                     )
                 except MessageNotModified:
@@ -320,7 +361,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             try:
                 await callback_query.message.edit_text(
                     text='该下载任务不存在或已完成。',
-                    reply_markup=self.__download_task_list_keyboard(),
+                    reply_markup=self.__download_task_list_keyboard(request_user_id),
                     link_preview_options=LINK_PREVIEW_OPTIONS
                 )
             except MessageNotModified:
@@ -335,7 +376,7 @@ class TelegramRestrictedMediaDownloader(Bot):
         try:
             await callback_query.message.edit_text(
                 text=text,
-                reply_markup=self.__download_task_list_keyboard(),
+                reply_markup=self.__download_task_list_keyboard(request_user_id),
                 link_preview_options=LINK_PREVIEW_OPTIONS
             )
         except MessageNotModified:
@@ -406,7 +447,10 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.video_filename_choice_counter += 1
         token = str(self.video_filename_choice_counter)
         future = self.loop.create_future()
-        self.video_filename_choices[token] = future
+        self.video_filename_choices[token] = {
+            'future': future,
+            'request_user_id': request_user_id
+        }
         reply_markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton('使用新命名', callback_data=f'{self.VIDEO_FILENAME_CALLBACK_PREFIX}:{token}:new'),
@@ -482,6 +526,14 @@ class TelegramRestrictedMediaDownloader(Bot):
             message: pyrogram.types.Message,
             with_upload: Union[dict, None] = None
     ):
+        if not self.is_authorized_bot_user(message.from_user.id):
+            await client.send_message(
+                chat_id=message.from_user.id,
+                reply_parameters=ReplyParameters(message_id=message.id),
+                text=f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{message.from_user.id}`。',
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
         self.last_client = client
         self.last_message = message
         link_meta: Union[dict, None] = await super().get_download_link_from_bot(client, message)
@@ -545,9 +597,11 @@ class TelegramRestrictedMediaDownloader(Bot):
             last_bot_message: Union[pyrogram.types.Message, None]
     ) -> None:
         task_id = self.__next_active_download_task_id()
+        request_user_id = getattr(getattr(message, 'from_user', None), 'id', None)
         self.pending_download_tasks[task_id] = {
             'link': link,
             'status': '等待中',
+            'request_user_id': request_user_id,
             'cancel_requested': False
         }
         self.bot_task_link.add(link)
@@ -681,6 +735,188 @@ class TelegramRestrictedMediaDownloader(Bot):
             upload_task=upload_task,
         )
 
+    def __save_bot_allowed_users(self, user_ids: list) -> list:
+        user_ids = self.app.normalize_bot_allowed_users(user_ids)
+        user_ids = [user_id for user_id in user_ids if user_id not in self.root and user_id not in self.get_bot_admin_users()]
+        self.app.bot_allowed_users = user_ids
+        self.app.config['bot_allowed_users'] = user_ids
+        self.app.save_config(self.app.config)
+        return user_ids
+
+    def __save_bot_admin_users(self, user_ids: list) -> list:
+        user_ids = self.app.normalize_bot_allowed_users(user_ids)
+        user_ids = [user_id for user_id in user_ids if user_id not in self.root]
+        self.app.bot_admin_users = user_ids
+        self.app.config['bot_admin_users'] = user_ids
+        self.app.config['bot_allowed_users'] = [
+            user_id for user_id in self.get_bot_allowed_users()
+            if user_id not in user_ids and user_id not in self.root
+        ]
+        self.app.bot_allowed_users = self.app.config['bot_allowed_users']
+        self.app.save_config(self.app.config)
+        return user_ids
+
+    def __bot_user_setting_text(self, notice: str = '') -> str:
+        admin_users = self.get_bot_admin_users()
+        allowed_users = self.get_bot_allowed_users()
+        text = (
+            '👥机器人用户权限设置\n\n'
+            '管理员:拥有所有机器人功能。登录主账号始终为管理员,无需添加。\n'
+            '普通用户:仅可创建下载任务、查看/取消自己的任务、选择自己的视频命名。\n'
+        )
+        if self.root:
+            text += '\n主账号管理员ID:\n' + '\n'.join(f'- `{user_id}`' for user_id in self.root)
+        if admin_users:
+            text += '\n\n额外管理员ID:\n' + '\n'.join(f'- `{user_id}`' for user_id in admin_users)
+        else:
+            text += '\n\n当前没有额外管理员。'
+        if allowed_users:
+            text += '\n\n普通用户ID:\n' + '\n'.join(f'- `{user_id}`' for user_id in allowed_users)
+        else:
+            text += '\n\n当前没有普通用户。'
+        if notice:
+            text += f'\n\n{notice}'
+        return text
+
+    def __bot_user_setting_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [[
+            InlineKeyboardButton(
+                text=BotButton.BOT_ADMIN_USER_ADD,
+                callback_data=BotCallbackText.BOT_ADMIN_USER_ADD
+            ),
+            InlineKeyboardButton(
+                text=BotButton.BOT_USER_ADD,
+                callback_data=BotCallbackText.BOT_USER_ADD
+            )
+        ]]
+        for user_id in self.get_bot_admin_users():
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f'{BotButton.DROP} 管理员 {user_id}',
+                    callback_data=f'{BotCallbackText.BOT_ADMIN_USER_REMOVE}:{user_id}'
+                )
+            ])
+        for user_id in self.get_bot_allowed_users():
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f'{BotButton.DROP} 普通用户 {user_id}',
+                    callback_data=f'{BotCallbackText.BOT_USER_REMOVE}:{user_id}'
+                )
+            ])
+        keyboard.append([
+            InlineKeyboardButton(text=BotButton.RETURN, callback_data=BotCallbackText.SETTING),
+            InlineKeyboardButton(text=BotButton.HELP_PAGE, callback_data=BotCallbackText.BACK_HELP)
+        ])
+        return InlineKeyboardMarkup(keyboard)
+
+    async def __show_bot_user_setting(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            notice: str = ''
+    ) -> None:
+        try:
+            await callback_query.message.edit_text(
+                text=self.__bot_user_setting_text(notice),
+                reply_markup=self.__bot_user_setting_keyboard(),
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+        except MessageNotModified:
+            pass
+
+    def __toggle_bot_user_input_handler(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            enable: bool,
+            role: str = 'normal'
+    ) -> None:
+        if self.bot_user_input_handler:
+            self.remove_handler(self.bot_user_input_handler, group=-1)
+            self.bot_user_input_handler = None
+        if not enable:
+            return None
+        self.bot_user_input_handler = MessageHandler(
+            partial(self.__handle_bot_user_input, callback_query, role),
+            filters=self.bot_admin_filter() & pyrogram.filters.text & (
+                lambda client, m: isinstance(m, pyrogram.types.Message) and m.text and not m.text.startswith('/')
+            )
+        )
+        self.add_handler(self.bot_user_input_handler, group=-1)
+
+    async def __start_bot_user_input(self, callback_query: pyrogram.types.CallbackQuery, role: str = 'normal') -> None:
+        self.__toggle_bot_user_input_handler(callback_query, True, role=role)
+        role_text = '管理员' if role == 'admin' else '普通用户'
+        await callback_query.message.edit_text(
+            text=f'请发送要添加为机器人{role_text}的Telegram用户ID。\n\n可一次发送多个ID,用空格、逗号或换行分隔。',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                text=BotButton.CANCEL,
+                callback_data=BotCallbackText.BOT_USER_INPUT_CANCEL
+            )]]),
+            link_preview_options=LINK_PREVIEW_OPTIONS
+        )
+
+    async def __handle_bot_user_input(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            role: str,
+            _client: pyrogram.Client,
+            message: pyrogram.types.Message
+    ) -> None:
+        self.__toggle_bot_user_input_handler(callback_query, False)
+        raw_ids = message.text.replace(',', ' ').replace('\n', ' ').split()
+        new_user_ids = self.app.normalize_bot_allowed_users(raw_ids)
+        if not new_user_ids:
+            await self.__show_bot_user_setting(callback_query, '未识别到有效用户ID。')
+            return None
+        admin_users = self.get_bot_admin_users()
+        allowed_users = self.get_bot_allowed_users()
+        added = []
+        for user_id in new_user_ids:
+            if user_id in self.root:
+                continue
+            if role == 'admin':
+                if user_id not in admin_users:
+                    admin_users.append(user_id)
+                    added.append(user_id)
+                allowed_users = [item for item in allowed_users if item != user_id]
+            else:
+                if user_id not in admin_users and user_id not in allowed_users:
+                    allowed_users.append(user_id)
+                    added.append(user_id)
+        if role == 'admin':
+            self.__save_bot_admin_users(admin_users)
+        self.__save_bot_allowed_users(allowed_users)
+        role_text = '管理员' if role == 'admin' else '普通用户'
+        notice = f'已添加{role_text}:{", ".join(map(str, added))}。' if added else '没有新增用户ID。'
+        await self.__show_bot_user_setting(callback_query, notice)
+
+    async def __remove_bot_admin_user(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            user_id: str
+    ) -> None:
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            await self.__show_bot_user_setting(callback_query, '用户ID无效。')
+            return None
+        users = [item for item in self.get_bot_admin_users() if item != user_id]
+        self.__save_bot_admin_users(users)
+        await self.__show_bot_user_setting(callback_query, f'已移除管理员:{user_id}。')
+
+    async def __remove_bot_allowed_user(
+            self,
+            callback_query: pyrogram.types.CallbackQuery,
+            user_id: str
+    ) -> None:
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            await self.__show_bot_user_setting(callback_query, '用户ID无效。')
+            return None
+        users = [item for item in self.get_bot_allowed_users() if item != user_id]
+        self.__save_bot_allowed_users(users)
+        await self.__show_bot_user_setting(callback_query, f'已移除普通用户:{user_id}。')
+
     @staticmethod
     async def __send_pay_qr(
             client: pyrogram.Client,
@@ -729,8 +965,17 @@ class TelegramRestrictedMediaDownloader(Bot):
             client: pyrogram.Client,
             message: pyrogram.types.Message
     ) -> None:
-        pending_tasks = self.__get_pending_download_tasks()
-        active_tasks = self.__get_active_download_tasks()
+        request_user_id = message.from_user.id
+        if not self.is_authorized_bot_user(request_user_id):
+            await client.send_message(
+                chat_id=request_user_id,
+                reply_parameters=ReplyParameters(message_id=message.id),
+                text=f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{request_user_id}`。',
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
+        pending_tasks = self.__get_pending_download_tasks(request_user_id)
+        active_tasks = self.__get_active_download_tasks(request_user_id)
         text_parts = []
         if pending_tasks:
             text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
@@ -747,7 +992,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             chat_id=message.from_user.id,
             reply_parameters=ReplyParameters(message_id=message.id),
             text=safe_message(text)[0],
-            reply_markup=self.__download_task_list_keyboard(),
+            reply_markup=self.__download_task_list_keyboard(request_user_id),
             link_preview_options=LINK_PREVIEW_OPTIONS
         )
 
@@ -756,10 +1001,32 @@ class TelegramRestrictedMediaDownloader(Bot):
         kb = KeyboardButton(callback_query)
         if callback_data is None:
             return None
+        public_callback = (
+                callback_data == BotCallbackText.DOWNLOAD_TASKS or
+                callback_data == BotCallbackText.PAY or
+                callback_data == BotCallbackText.BACK_HELP or
+                callback_data.startswith(f'{self.VIDEO_FILENAME_CALLBACK_PREFIX}:') or
+                callback_data.startswith(f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:') or
+                callback_data.startswith(f'{BotCallbackText.DOWNLOAD_TASK_CANCEL_CONFIRM}:')
+        )
+        auth_free_callback = callback_data in (BotCallbackText.PAY, BotCallbackText.BACK_HELP)
+        if not auth_free_callback and public_callback and not self.is_authorized_bot_user(callback_query.from_user.id):
+            await callback_query.message.reply_text(
+                f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{callback_query.from_user.id}`。'
+            )
+            return None
+        if not public_callback and not self.__is_admin_user(callback_query.from_user.id):
+            await callback_query.message.reply_text('无权操作该功能。')
+            return None
         elif callback_data.startswith(f'{self.VIDEO_FILENAME_CALLBACK_PREFIX}:'):
             try:
                 _, token, mode = callback_data.split(':', 2)
-                future = self.video_filename_choices.get(token)
+                choice_meta = self.video_filename_choices.get(token)
+                future = choice_meta.get('future') if isinstance(choice_meta, dict) else choice_meta
+                request_user_id = choice_meta.get('request_user_id') if isinstance(choice_meta, dict) else None
+                if request_user_id is not None and request_user_id != callback_query.from_user.id:
+                    await callback_query.message.reply_text('无权操作该视频命名选择。')
+                    return None
                 if future and not future.done() and mode in ('new', 'old'):
                     future.set_result(mode)
                     await callback_query.message.edit_text(
@@ -810,7 +1077,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                 msg = '🥰🥰🥰\n收款「二维码」已发送至您的「终端」与「对话框」十分感谢您的支持!'
             await callback_query.message.reply_text(msg)
         elif callback_data == BotCallbackText.BACK_HELP:
-            meta: dict = await self.help()
+            meta: dict = await self.help(request_user_id=callback_query.from_user.id)
             await callback_query.message.edit_text(meta.get('text'))
             await callback_query.message.edit_reply_markup(meta.get('keyboard'))
         elif callback_data == BotCallbackText.BACK_TABLE:
@@ -865,6 +1132,19 @@ class TelegramRestrictedMediaDownloader(Bot):
                 log.error(f'启用或禁用自动关机失败,{_t(KeyWord.REASON)}:"{e}"')
         elif callback_data == BotCallbackText.SETTING:
             await kb.toggle_setting_button(global_config=self.gc.config, user_config=self.app.config)
+        elif callback_data == BotCallbackText.BOT_USER_SETTING:
+            await self.__show_bot_user_setting(callback_query)
+        elif callback_data == BotCallbackText.BOT_USER_ADD:
+            await self.__start_bot_user_input(callback_query, role='normal')
+        elif callback_data == BotCallbackText.BOT_ADMIN_USER_ADD:
+            await self.__start_bot_user_input(callback_query, role='admin')
+        elif callback_data == BotCallbackText.BOT_USER_INPUT_CANCEL:
+            self.__toggle_bot_user_input_handler(callback_query, False)
+            await self.__show_bot_user_setting(callback_query, '已取消添加用户ID。')
+        elif callback_data.startswith(f'{BotCallbackText.BOT_USER_REMOVE}:'):
+            await self.__remove_bot_allowed_user(callback_query, callback_data.split(':', 1)[1])
+        elif callback_data.startswith(f'{BotCallbackText.BOT_ADMIN_USER_REMOVE}:'):
+            await self.__remove_bot_admin_user(callback_query, callback_data.split(':', 1)[1])
         elif callback_data == BotCallbackText.EXPORT_TABLE:
             await kb.toggle_table_button(config=self.gc.config)
         elif callback_data == BotCallbackText.DOWNLOAD_SETTING:
@@ -2030,6 +2310,15 @@ class TelegramRestrictedMediaDownloader(Bot):
     ):
         chat_id = user_message.from_user.id
         message_id = user_message.id
+        if not self.is_authorized_bot_user(chat_id):
+            log.info(f'未授权用户发送媒体到机器人:user_id={chat_id},message_id={message_id}')
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{chat_id}`。',
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
+        log.info(f'用户发送媒体到机器人,准备创建下载任务:user_id={chat_id},message_id={message_id}')
         last_message = await self.bot.send_message(
             chat_id=chat_id,
             text=f'🔄正在处理转发内容`{message_id}`...'
@@ -2040,7 +2329,8 @@ class TelegramRestrictedMediaDownloader(Bot):
                 diy_download_type=[_ for _ in DownloadType()],
                 single_link=True,
                 request_client=self.bot,
-                request_message=user_message
+                request_message=user_message,
+                download_client=user_client
             )
             if task.get('status') == DownloadStatus.DOWNLOADING:
                 await last_message.edit_text(text=f'✅已创建下载任务`{message_id}`。')
@@ -2058,8 +2348,10 @@ class TelegramRestrictedMediaDownloader(Bot):
             progress: Callable = None,
             progress_args: tuple = (),
             chunk_size: int = 1024 * 1024,
-            compare_size: Union[int, None] = None  # 不为None时,将通过大小比对判断是否为完整文件。
+            compare_size: Union[int, None] = None,  # 不为None时,将通过大小比对判断是否为完整文件。
+            download_client: Optional[pyrogram.Client] = None
     ) -> str:
+        download_client = download_client or self.app.client
         temp_path = f'{file_name}.temp'
         if os.path.exists(file_name) and compare_size:
             local_file_size: int = get_file_size(file_path=file_name)
@@ -2104,7 +2396,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             f.seek(downloaded)
             while True:
                 try:
-                    async for chunk in self.app.client.stream_media(message=message, offset=skip_chunks):
+                    async for chunk in download_client.stream_media(message=message, offset=skip_chunks):
                         f.write(chunk)
                         downloaded += len(chunk)
                         progress(downloaded, *progress_args)
@@ -2115,7 +2407,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                     chat_id = message.chat.id
                     message_id = message.id
                     try:
-                        message = await self.app.client.get_messages(chat_id=chat_id, message_ids=message_id)
+                        message = await download_client.get_messages(chat_id=chat_id, message_ids=message_id)
                         skip_chunks: int = downloaded // chunk_size
                         f.seek(downloaded)
                     except Exception as refresh_error:
@@ -2124,7 +2416,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                 except (FloodWait, FloodPremiumWait) as e:
                     amount = e.value
                     console.log(
-                        f'[{self.app.client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
+                        f'[{download_client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
                         style='#FF4689'
                     )
                     await asyncio.sleep(amount)
@@ -2142,15 +2434,17 @@ class TelegramRestrictedMediaDownloader(Bot):
             progress: Callable = None,
             progress_args: tuple = (),
             chunk_size: int = 1024 * 1024,
-            compare_size: Union[int, None] = None
+            compare_size: Union[int, None] = None,
+            download_client: Optional[pyrogram.Client] = None
     ) -> Union[str, None]:
         """将小文件下载到内存,完成后一次性写入最终保存目录。"""
+        download_client = download_client or self.app.client
         downloaded: int = 0
         skip_chunks: int = 0
         buffer = bytearray()
         while True:
             try:
-                async for chunk in self.app.client.stream_media(message=message, offset=skip_chunks):
+                async for chunk in download_client.stream_media(message=message, offset=skip_chunks):
                     if self.app.memory_download_limit_bytes and downloaded + len(chunk) > self.app.memory_download_limit_bytes:
                         log.warning(f'内存下载超过上限:{self.app.memory_download_limit}MB,已取消本次内存下载。')
                         return None
@@ -2162,7 +2456,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             except FileReferenceExpired as e:
                 log.warning(f'文件引用已过期,正在重新获取消息以刷新引用,{_t(KeyWord.REASON)}:"{e}"')
                 try:
-                    message = await self.app.client.get_messages(chat_id=message.chat.id, message_ids=message.id)
+                    message = await download_client.get_messages(chat_id=message.chat.id, message_ids=message.id)
                     skip_chunks = downloaded // chunk_size
                 except Exception as refresh_error:
                     log.error(f'重新获取消息失败,{_t(KeyWord.REASON)}:"{refresh_error}"')
@@ -2170,7 +2464,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             except (FloodWait, FloodPremiumWait) as e:
                 amount = e.value
                 console.log(
-                    f'[{self.app.client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
+                    f'[{download_client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
                     style='#FF4689'
                 )
                 await asyncio.sleep(amount)
@@ -2227,7 +2521,8 @@ class TelegramRestrictedMediaDownloader(Bot):
             request_client: Optional[pyrogram.Client] = None,
             request_message: Optional[pyrogram.types.Message] = None,
             track_task_id: Union[str, None] = None,
-            download_slot_acquired: bool = False
+            download_slot_acquired: bool = False,
+            download_client: Optional[pyrogram.Client] = None
     ) -> None:
         retry_count = retry.get('count')
         retry_id = retry.get('id')
@@ -2240,13 +2535,13 @@ class TelegramRestrictedMediaDownloader(Bot):
                     if _message.id == retry_id:
                         await self.__add_task(
                             chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                            request_client, request_message, track_task_id, download_slot_acquired)
+                            request_client, request_message, track_task_id, download_slot_acquired, download_client)
                         break
                 else:
                     child_download_slot_acquired = download_slot_acquired if child_track_task_id else False
                     await self.__add_task(
                         chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                        request_client, request_message, child_track_task_id, child_download_slot_acquired)
+                        request_client, request_message, child_track_task_id, child_download_slot_acquired, download_client)
         else:
             _task = None
             valid_dtype: str = next((_ for _ in DownloadType() if getattr(message, _, None)), None)  # 判断该链接是否为有支持的类型。
@@ -2304,6 +2599,9 @@ class TelegramRestrictedMediaDownloader(Bot):
                         task_id=None,
                         with_upload=with_upload,
                         diy_download_type=diy_download_type,
+                        request_client=request_client,
+                        request_message=request_message,
+                        download_client=download_client,
                         _future=save_directory
                     )
                 else:
@@ -2333,6 +2631,10 @@ class TelegramRestrictedMediaDownloader(Bot):
                     self.active_download_tasks[active_task_id] = {
                         'task': None,
                         'link': link,
+                        'request_user_id': getattr(getattr(request_message, 'from_user', None), 'id', None),
+                        'request_client': request_client,
+                        'request_message': request_message,
+                        'download_client': download_client,
                         'chat_id': chat_id,
                         'message_id': file_id,
                         'file_name': file_name,
@@ -2354,6 +2656,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                         ),
                         'compare_size': sever_file_size
                     }
+                    download_kwargs['download_client'] = download_client or self.app.client
                     if memory_download:
                         download_kwargs['save_file_path'] = save_directory
                     else:
@@ -2379,6 +2682,9 @@ class TelegramRestrictedMediaDownloader(Bot):
                             task_id,
                             with_upload,
                             diy_download_type,
+                            request_client,
+                            request_message,
+                            download_client,
                             video_filename_mode=video_filename_mode,
                             memory_download=memory_download
                         )
@@ -2475,6 +2781,9 @@ class TelegramRestrictedMediaDownloader(Bot):
             task_id,
             with_upload,
             diy_download_type,
+            request_client: Optional[pyrogram.Client],
+            request_message: Optional[pyrogram.types.Message],
+            download_client: Optional[pyrogram.Client],
             _future,
             video_filename_mode: Union[str, None] = None,
             memory_download: bool = False
@@ -2593,14 +2902,17 @@ class TelegramRestrictedMediaDownloader(Bot):
                     retry_count += 1
                     task = self.loop.create_task(
                         self.create_download_task(
-                            message_ids=link if isinstance(link, str) else message,
+                            message_ids=link if isinstance(link, str) and link.startswith('https://t.me/') else message,
                             retry={
                                 'id': file_id,
                                 'count': retry_count,
                                 'video_filename_mode': video_filename_mode
                             },
                             with_upload=with_upload,
-                            diy_download_type=diy_download_type
+                            diy_download_type=diy_download_type,
+                            request_client=request_client,
+                            request_message=request_message,
+                            download_client=download_client
                         )
                     )
                     task.add_done_callback(
@@ -2873,10 +3185,12 @@ class TelegramRestrictedMediaDownloader(Bot):
             request_client: Optional[pyrogram.Client] = None,
             request_message: Optional[pyrogram.types.Message] = None,
             track_task_id: Union[str, None] = None,
-            download_slot_acquired: bool = False
+            download_slot_acquired: bool = False,
+            download_client: Optional[pyrogram.Client] = None
     ) -> dict:
         retry = retry if retry else {'id': -1, 'count': 0}
         diy_download_type = [_ for _ in DownloadType()] if with_upload else diy_download_type
+        download_client = download_client or self.app.client
         try:
             if isinstance(message_ids, pyrogram.types.Message):
                 chat_id = message_ids.chat.id
@@ -2886,21 +3200,25 @@ class TelegramRestrictedMediaDownloader(Bot):
                     'message': message_ids,
                     'member_num': 1
                 }
-                link = message_ids.link if message_ids.link else message_ids.id
+                message_link = getattr(message_ids, 'link', None)
+                link = message_link if message_link else f'{chat_id}/{message_ids.id}'
             else:
                 meta: dict = await get_message_by_link(
-                    client=self.app.client,
+                    client=download_client,
                     link=message_ids,
                     single_link=single_link
                 )
                 link = message_ids
 
             link_type, chat_id, message, member_num = meta.values()
+            request_user_id = getattr(getattr(request_message, 'from_user', None), 'id', None)
             DownloadTask.set(link, 'link_type', link_type)
             DownloadTask.set(link, 'member_num', member_num)
+            if request_user_id is not None:
+                DownloadTask.set(link, 'request_user_id', request_user_id)
             await self.__add_task(
                 chat_id, link_type, link, message, retry, with_upload, diy_download_type,
-                request_client, request_message, track_task_id, download_slot_acquired)
+                request_client, request_message, track_task_id, download_slot_acquired, download_client)
             return {
                 'chat_id': chat_id,
                 'member_num': member_num,

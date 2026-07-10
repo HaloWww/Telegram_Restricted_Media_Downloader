@@ -40,7 +40,7 @@ from module import (
 )
 from module.language import _t
 from module.stdio import MetaData
-from module.task import UploadTask
+from module.task import DownloadTask, UploadTask
 from module.config import GlobalConfig
 from module.path_tool import safe_scan_directory_file
 from module.util import (
@@ -95,6 +95,41 @@ class Bot:
         self.download_chat_filter: dict = {}
         self.adding_keywords: list = []  # 用于跟踪正在添加的关键词列表。
         self.keyword_handler: Union[MessageHandler, None] = None  # 关键词输入模式的handler。
+        self.bot_user_input_handler: Union[MessageHandler, None] = None
+
+    def get_bot_allowed_users(self) -> list:
+        application = getattr(self, 'application', None) or getattr(self, 'app', None)
+        return getattr(application, 'bot_allowed_users', []) or []
+
+    def get_bot_admin_users(self) -> list:
+        application = getattr(self, 'application', None) or getattr(self, 'app', None)
+        return getattr(application, 'bot_admin_users', []) or []
+
+    def is_bot_admin_user(self, user_id: Union[int, None]) -> bool:
+        return user_id is not None and (user_id in self.root or user_id in self.get_bot_admin_users())
+
+    def is_authorized_bot_user(self, user_id: Union[int, None]) -> bool:
+        return user_id is not None and (self.is_bot_admin_user(user_id) or user_id in self.get_bot_allowed_users())
+
+    def bot_admin_filter(self):
+        return pyrogram.filters.create(
+            lambda _, __, m: self.is_bot_admin_user(getattr(getattr(m, 'from_user', None), 'id', None)),
+            name='BotAdminFilter'
+        )
+
+    @staticmethod
+    def private_callback_filter():
+        def _private_callback(_, __, callback_query):
+            message = getattr(callback_query, 'message', None)
+            chat = getattr(message, 'chat', None)
+            return bool(
+                chat and getattr(chat, 'type', None) in {
+                    pyrogram.enums.ChatType.PRIVATE,
+                    pyrogram.enums.ChatType.BOT
+                }
+            )
+
+        return pyrogram.filters.create(_private_callback, name='PrivateCallbackFilter')
 
     def add_handler(self, handler, group: int = 0):
         """添加handler到指定的group。直接操作dispatcher.groups以确保正确添加。"""
@@ -121,7 +156,7 @@ class Bot:
             # 先创建 handler 对象，然后添加。
             self.keyword_handler = MessageHandler(
                 partial(self.handle_keyword_input, chat_id, callback_query, callback_prompt),
-                filters=pyrogram.filters.user(self.root) & pyrogram.filters.text & (
+                filters=self.bot_admin_filter() & pyrogram.filters.text & (
                     lambda client, m: isinstance(
                         m,
                         pyrogram.types.Message
@@ -139,8 +174,21 @@ class Bot:
                 self.keyword_handler = None
 
     async def process_error_message(self, client: pyrogram.Client, message: pyrogram.types.Message) -> None:
-        if self.keyword_handler:
+        if self.keyword_handler or self.bot_user_input_handler:
             return
+        text = (message.text or '').strip()
+        if text.startswith('/'):
+            log.debug(f'跳过命令兜底处理:user_id={message.from_user.id},text={text}')
+            return None
+        if not self.is_authorized_bot_user(message.from_user.id):
+            log.info(f'未授权用户尝试使用机器人:user_id={message.from_user.id},text={message.text}')
+            await client.send_message(
+                chat_id=message.from_user.id,
+                reply_parameters=ReplyParameters(message_id=message.id),
+                text=f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{message.from_user.id}`。',
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
+            return None
         await self.help(client, message)
         await client.send_message(
             chat_id=message.from_user.id,
@@ -237,25 +285,9 @@ class Bot:
             with_upload: Union[dict, None] = None
     ) -> Union[Dict[str, Union[set, pyrogram.types.Message]], None]:
         text: str = message.text
-        if text == '/download':
-            await client.send_message(
-                chat_id=message.from_user.id,
-                reply_parameters=ReplyParameters(message_id=message.id),
-                text='⚠️⚠️⚠️请提供下载链接⚠️⚠️⚠️语法:\n`/download https://t.me/x/x`',
-                link_preview_options=LINK_PREVIEW_OPTIONS
-            )
-        elif text.startswith('https://t.me/'):
+        if text.startswith('https://t.me/'):
             if text[len('https://t.me/'):].count('/') >= 1:
-                try:
-                    await client.delete_messages(chat_id=message.from_user.id, message_ids=message.id)
-                    await self.send_message_to_bot(text=f'/download {text}', catch=True)
-                except Exception as e:
-                    await client.send_message(
-                        chat_id=message.from_user.id,
-                        reply_parameters=ReplyParameters(message_id=message.id),
-                        text=f'{e}\n⬇️⬇️⬇️请使用以下命令分配下载任务⬇️⬇️⬇️\n`/download {text}`',
-                        link_preview_options=LINK_PREVIEW_OPTIONS
-                    )
+                text = f'/download {text}'
             else:
                 await client.send_message(
                     chat_id=message.from_user.id,
@@ -263,6 +295,14 @@ class Bot:
                     text=f'⬇️⬇️⬇️请使用以下命令分配下载任务⬇️⬇️⬇️\n`/download https://t.me/x/x`',
                     link_preview_options=LINK_PREVIEW_OPTIONS
                 )
+                return None
+        if text == '/download':
+            await client.send_message(
+                chat_id=message.from_user.id,
+                reply_parameters=ReplyParameters(message_id=message.id),
+                text='⚠️⚠️⚠️请提供下载链接⚠️⚠️⚠️语法:\n`/download https://t.me/x/x`',
+                link_preview_options=LINK_PREVIEW_OPTIONS
+            )
         elif len(text) <= 25 or text == '/download https://t.me/x/x' or text.endswith('.txt'):
             await self.help(client, message)
             await client.send_message(
@@ -442,45 +482,79 @@ class Bot:
                 last_bot_messages.append(last_bot_message)
         return last_bot_messages[-1]
 
-    @staticmethod
     async def help(
+            self,
             client: Union[pyrogram.Client, None] = None,
-            message: Union[pyrogram.types.Message, None] = None
+            message: Union[pyrogram.types.Message, None] = None,
+            request_user_id: Union[int, None] = None
     ) -> Union[None, dict]:  # client与message都为None时,返回keyboard与text。
-        keyboard = InlineKeyboardMarkup(
-            [
+        if request_user_id is None and message:
+            request_user_id = message.from_user.id
+        is_admin = self.is_bot_admin_user(request_user_id) if request_user_id is not None else True
+        is_authorized = self.is_authorized_bot_user(request_user_id) if request_user_id is not None else True
+        if not is_authorized:
+            text = f'⚠️无权使用此机器人,请联系管理员添加用户ID:`{request_user_id}`。'
+            keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton(
-                        BotButton.GITHUB,
-                        url='https://github.com/Gentlesprite/Telegram_Restricted_Media_Downloader/releases'
-                    ),
-                    InlineKeyboardButton(
-                        BotButton.SUBSCRIBE_CHANNEL,
-                        url='https://t.me/RestrictedMediaDownloader'
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        BotButton.VIDEO_TUTORIAL,
-                        url='https://www.youtube.com/watch?v=ucwKJu-MrBw'
-                    ),
                     InlineKeyboardButton(
                         BotButton.PAY,
                         callback_data=BotCallbackText.PAY
                     )
-                ],
-                [
-                    InlineKeyboardButton(
-                        BotButton.DOWNLOAD_TASKS,
-                        callback_data=BotCallbackText.DOWNLOAD_TASKS
-                    ),
-                    InlineKeyboardButton(
-                        BotButton.SETTING,
-                        callback_data=BotCallbackText.SETTING
-                    )
                 ]
+            ])
+            if not all([client, message]):
+                return {
+                    'keyboard': keyboard,
+                    'text': text
+                }
+            await client.send_message(
+                chat_id=message.from_user.id,
+                text=text,
+                link_preview_options=LINK_PREVIEW_OPTIONS,
+                reply_markup=keyboard
+            )
+            return None
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    BotButton.GITHUB,
+                    url='https://github.com/Gentlesprite/Telegram_Restricted_Media_Downloader/releases'
+                ),
+                InlineKeyboardButton(
+                    BotButton.SUBSCRIBE_CHANNEL,
+                    url='https://t.me/RestrictedMediaDownloader'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    BotButton.VIDEO_TUTORIAL,
+                    url='https://www.youtube.com/watch?v=ucwKJu-MrBw'
+                ),
+                InlineKeyboardButton(
+                    BotButton.PAY,
+                    callback_data=BotCallbackText.PAY
+                )
             ]
-        )
+        ]
+        if is_admin:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    BotButton.DOWNLOAD_TASKS,
+                    callback_data=BotCallbackText.DOWNLOAD_TASKS
+                ),
+                InlineKeyboardButton(
+                    BotButton.SETTING,
+                    callback_data=BotCallbackText.SETTING
+                )
+            ])
+        else:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    BotButton.DOWNLOAD_TASKS,
+                    callback_data=BotCallbackText.DOWNLOAD_TASKS
+                )
+            ])
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
 
         text = (
             f'`\n💎 {SOFTWARE_FULL_NAME} v{__version__} 💎\n'
@@ -490,17 +564,17 @@ class Bot:
             f'🛎️ {BotCommandText.with_description(BotCommandText.HELP)}\n'
             f'📁 {BotCommandText.with_description(BotCommandText.DOWNLOAD)}\n'
             f'📥 {BotCommandText.with_description(BotCommandText.TASKS)}\n'
-            f'📝 {BotCommandText.with_description(BotCommandText.TABLE)}\n'
-            f'↗️ {BotCommandText.with_description(BotCommandText.FORWARD)}\n'
-            f'❌ {BotCommandText.with_description(BotCommandText.EXIT)}\n'
-            f'🕵️ {BotCommandText.with_description(BotCommandText.LISTEN_DOWNLOAD)}\n'
-            f'📲 {BotCommandText.with_description(BotCommandText.LISTEN_FORWARD)}\n'
-            f'🔍 {BotCommandText.with_description(BotCommandText.LISTEN_INFO)}\n'
-            f'📤 {BotCommandText.with_description(BotCommandText.UPLOAD)}\n'
-            f'🌳 {BotCommandText.with_description(BotCommandText.UPLOAD_R)}\n'
-            f'💬 {BotCommandText.with_description(BotCommandText.DOWNLOAD_CHAT)}\n\n'
-            f'✨ 其他功能:\n'
-            f'📨 转发`视频`、`图片`、`音频`、`语音`、`GIF`、`文档`、`视频笔记`类型的消息给我,即可创建下载任务。\n'
+            f'{("📝 " + BotCommandText.with_description(BotCommandText.TABLE) + chr(10)) if is_admin else ""}'
+            f'{("↗️ " + BotCommandText.with_description(BotCommandText.FORWARD) + chr(10)) if is_admin else ""}'
+            f'{("❌ " + BotCommandText.with_description(BotCommandText.EXIT) + chr(10)) if is_admin else ""}'
+            f'{("🕵️ " + BotCommandText.with_description(BotCommandText.LISTEN_DOWNLOAD) + chr(10)) if is_admin else ""}'
+            f'{("📲 " + BotCommandText.with_description(BotCommandText.LISTEN_FORWARD) + chr(10)) if is_admin else ""}'
+            f'{("🔍 " + BotCommandText.with_description(BotCommandText.LISTEN_INFO) + chr(10)) if is_admin else ""}'
+            f'{("📤 " + BotCommandText.with_description(BotCommandText.UPLOAD) + chr(10)) if is_admin else ""}'
+            f'{("🌳 " + BotCommandText.with_description(BotCommandText.UPLOAD_R) + chr(10)) if is_admin else ""}'
+            f'{("💬 " + BotCommandText.with_description(BotCommandText.DOWNLOAD_CHAT) + chr(10)) if is_admin else ""}'
+            f'\n✨ 其他功能:\n'
+            f'📨 发送Telegram消息链接或直接发送/转发媒体给我,即可创建下载任务。\n'
         )
         if not all([client, message]):
             return {
@@ -967,22 +1041,33 @@ class Bot:
 
     async def done_notice(
             self,
-            text
+            text,
+            chat_id: Union[int, None] = None,
+            link: Union[str, None] = None
     ):
         if self.gc.get_config(BotCallbackText.NOTICE):
-            if all([self.last_client, self.last_message]):
+            if chat_id is None and link is not None:
+                try:
+                    chat_id = DownloadTask.get(link=link, key='request_user_id')
+                except Exception:
+                    chat_id = None
+            if chat_id is None and self.last_message:
+                chat_id = self.last_message.from_user.id
+            notice_client = self.bot or self.last_client
+            if notice_client and chat_id:
                 while True:
                     try:
-                        await self.last_client.send_message(
-                            chat_id=self.last_message.from_user.id,
+                        await notice_client.send_message(
+                            chat_id=chat_id,
                             text=f'📢通知:\n{text}',
                             link_preview_options=LINK_PREVIEW_OPTIONS
                         )
                         break
                     except (FloodWait, FloodPremiumWait) as e:
                         amount = e.value
+                        client_name = getattr(notice_client, 'name', 'bot')
                         console.log(
-                            f'[{self.bot.name}]发送消息请求频繁,要求等待{amount}秒后继续运行。',
+                            f'[{client_name}]发送消息请求频繁,要求等待{amount}秒后继续运行。',
                             style='#FF4689'
                         )
                         await asyncio.sleep(amount)
@@ -1006,90 +1091,108 @@ class Bot:
             await self.bot.set_bot_commands(self.COMMANDS)
             bot = await self.bot.get_me()
             bot_username = getattr(bot, 'username', None)
+            public_filter = pyrogram.filters.private
+            root_filter = pyrogram.filters.user(self.root)
+            admin_filter = self.bot_admin_filter()
+            private_callback_filter = self.private_callback_filter()
+            media_filter = (
+                    pyrogram.filters.video
+                    | pyrogram.filters.photo
+                    | pyrogram.filters.audio
+                    | pyrogram.filters.voice
+                    | pyrogram.filters.animation
+                    | pyrogram.filters.document
+                    | pyrogram.filters.video_note
+            )
 
             self.bot.add_handler(
                 MessageHandler(
                     self.start,
-                    filters=pyrogram.filters.command(['start']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['start']) & public_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.help,
-                    filters=pyrogram.filters.command(['help']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['help']) & public_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_download_link_from_bot,
-                    filters=pyrogram.filters.command(['download']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['download']) & public_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.download_tasks,
-                    filters=pyrogram.filters.command(['tasks']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['tasks']) & public_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_download_chat_link_from_bot,
-                    filters=pyrogram.filters.command(['download_chat']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['download_chat']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_upload_link_from_bot,
-                    filters=pyrogram.filters.command(['upload']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['upload']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_upload_link_from_bot,
-                    filters=pyrogram.filters.command(['upload_r']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['upload_r']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.table,
-                    filters=pyrogram.filters.command(['table']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['table']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_forward_link_from_bot,
-                    filters=pyrogram.filters.command(['forward']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['forward']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.exit,
-                    filters=pyrogram.filters.command(['exit']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['exit']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.on_listen,
-                    filters=pyrogram.filters.command(['listen_download', 'listen_forward']) & pyrogram.filters.user(
-                        self.root)
+                    filters=pyrogram.filters.command(['listen_download', 'listen_forward']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.listen_info,
-                    filters=pyrogram.filters.command(['listen_info']) & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.command(['listen_info']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.get_download_link_from_bot,
-                    filters=pyrogram.filters.regex(r'^https://t.me.*') & pyrogram.filters.user(self.root)
+                    filters=pyrogram.filters.regex(r'^https://t.me.*') & public_filter
+                )
+            )
+            self.bot.add_handler(
+                MessageHandler(
+                    self.handle_forwarded_media,
+                    filters=public_filter & media_filter & ~(root_filter & pyrogram.filters.forwarded)
                 )
             )
             self.user.add_handler(
                 MessageHandler(
                     self.handle_forwarded_media,
-                    filters=pyrogram.filters.user(self.root) & pyrogram.filters.forwarded & pyrogram.filters.chat(
+                    filters=root_filter & pyrogram.filters.forwarded & pyrogram.filters.chat(
                         bot_username) & (
                                     pyrogram.filters.video
                                     | pyrogram.filters.photo
@@ -1104,13 +1207,13 @@ class Bot:
             self.bot.add_handler(
                 CallbackQueryHandler(
                     self.callback_data,
-                    filters=pyrogram.filters.user(self.root)
+                    filters=private_callback_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
                     self.process_error_message,
-                    filters=pyrogram.filters.user(self.root) & ~(
+                    filters=public_filter & ~(
                             pyrogram.filters.video
                             | pyrogram.filters.photo
                             | pyrogram.filters.audio
@@ -1276,6 +1379,12 @@ class KeyboardButton:
                         InlineKeyboardButton(
                             text=BotButton.UPLOAD_SETTING,
                             callback_data=BotCallbackText.UPLOAD_SETTING
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text=BotButton.BOT_USER_SETTING,
+                            callback_data=BotCallbackText.BOT_USER_SETTING
                         )
                     ],
                     [

@@ -118,6 +118,29 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger('rich')
+
+
+def enable_debug_file_log(log_path: str = None) -> str:
+    log_path = os.path.abspath(log_path or f'{SOFTWARE_SHORT_NAME}_DEBUG.log')
+    os.makedirs(os.path.dirname(log_path) or os.getcwd(), exist_ok=True)
+    debug_handler = RotatingFileHandler(
+        filename=log_path,
+        maxBytes=MAX_LOG_SIZE,
+        backupCount=1,
+        encoding='UTF-8'
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)-8s pid:%(process)d thread:%(threadName)s '
+        '%(name)s:%(module)s:%(funcName)s:%(lineno)d - %(message)s',
+        datefmt=LOG_TIME_FORMAT
+    ))
+    logging.getLogger().addHandler(debug_handler)
+    log.setLevel(logging.DEBUG)
+    log.info(f'已开启详细DEBUG日志文件:"{log_path}"。')
+    return log_path
+
+
 log.info(f'{SOFTWARE_SHORT_NAME}:{__version__},更新日期:{__update_date__}。')
 log.info(f'文件日志等级:"{logging.getLevelName(FILE_LOG_LEVEL)}"。')
 log.info(f'终端日志等级:"{logging.getLevelName(CONSOLE_LOG_LEVEL)}"。')
@@ -128,6 +151,8 @@ api_hash: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx # 申请的api_hash。
 api_id: 'xxxxxxxx' # 申请的api_id。
 # bot_token（选填）如果不填，就不能使用机器人功能。可前往https://t.me/BotFather免费申请。
 bot_token: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+bot_admin_users: [] # 机器人管理员用户ID列表,登录主账号始终为管理员。
+bot_allowed_users: [] # 机器人普通用户ID列表,仅允许使用下载相关功能。
 download_type: # 需要下载的类型。支持的参数:video,photo,document,audio,voice,animation。
 - video # 视频。
 - photo # 图片。

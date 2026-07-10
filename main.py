@@ -5,6 +5,7 @@
 # File:main.py
 import os
 
+from module import enable_debug_file_log
 from module.enums import ENVIRON, MODE
 from module.util import check_environ
 from module.web import Web
@@ -13,6 +14,8 @@ from module.service import handle_service_command
 from module.downloader import TelegramRestrictedMediaDownloader
 
 if __name__ == '__main__':
+    if PARSE_ARGS.debug_log:
+        enable_debug_file_log(PARSE_ARGS.debug_log)
     if handle_service_command(__file__):
         raise SystemExit(0)
     check_environ()

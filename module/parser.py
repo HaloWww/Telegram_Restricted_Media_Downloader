@@ -72,6 +72,14 @@ class TelegramRestrictedMediaDownloaderArgumentParser(ArgumentParser):
             help='设置内存下载容量上限(MB),0为关闭'
         )
         self.add_argument(
+            '--debug-log', '--log-file',
+            type=str,
+            nargs='?',
+            const='TRMD_DEBUG.log',
+            default=None,
+            help='开启详细DEBUG日志输出到本地文件,可选指定文件路径'
+        )
+        self.add_argument(
             '--install-service',
             action='store_true',
             default=False,

@@ -141,6 +141,8 @@ class UserConfig(BaseConfig):
         'api_id': None,
         'api_hash': None,
         'bot_token': None,
+        'bot_admin_users': [],  # 机器人管理员用户ID列表,登录主账号始终为管理员。
+        'bot_allowed_users': [],  # 机器人普通用户ID列表,仅允许使用下载相关功能。
         'session_directory': None,
         'proxy': {
             'enable_proxy': None,
@@ -192,6 +194,11 @@ class UserConfig(BaseConfig):
         self.api_hash = self.config.get('api_hash')
         self.api_id = self.config.get('api_id')
         self.bot_token = self.config.get('bot_token')
+        self.bot_admin_users: list = self.normalize_bot_allowed_users(self.config.get('bot_admin_users'))
+        self.bot_allowed_users: list = [
+            user_id for user_id in self.normalize_bot_allowed_users(self.config.get('bot_allowed_users'))
+            if user_id not in self.bot_admin_users
+        ]
         self.download_type: list = self.config.get('download_type')
         self.is_shutdown: bool = self.config.get('is_shutdown')
         self.links: str = self.config.get('links')
@@ -232,6 +239,22 @@ class UserConfig(BaseConfig):
             return max(0, int(value if value is not None else 5))
         except (TypeError, ValueError):
             return 5
+
+    @staticmethod
+    def normalize_bot_allowed_users(value) -> list:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        user_ids = []
+        for user_id in value:
+            try:
+                user_id = int(str(user_id).strip())
+            except (TypeError, ValueError):
+                continue
+            if user_id not in user_ids:
+                user_ids.append(user_id)
+        return user_ids
 
     def get_last_history_record(self) -> None:
         """获取最近一次保存的历史配置文件。"""
@@ -401,8 +424,8 @@ class UserConfig(BaseConfig):
         try:
             if not self.modified and pre_load_config != UserConfig.TEMPLATE:
                 re_config: bool = False if PARSE_ARGS.quiet else gsp.get_is_re_config().get('is_re_config')
+                self.re_config = re_config
                 if re_config:
-                    self.re_config = re_config
                     # 缓存原有的session_directory，防止重新配置时丢失。
                     origin_session_directory = pre_load_config.get('session_directory')
                     pre_load_config: dict = UserConfig.TEMPLATE.copy()
@@ -418,6 +441,11 @@ class UserConfig(BaseConfig):
             _api_id: Union[str, None] = pre_load_config.get('api_id')
             _api_hash: Union[str, None] = pre_load_config.get('api_hash')
             _bot_token: Union[str, None] = pre_load_config.get('bot_token')
+            _bot_admin_users: list = self.normalize_bot_allowed_users(pre_load_config.get('bot_admin_users'))
+            _bot_allowed_users: list = [
+                user_id for user_id in self.normalize_bot_allowed_users(pre_load_config.get('bot_allowed_users'))
+                if user_id not in _bot_admin_users
+            ]
             _links: Union[str, None] = pre_load_config.get('links')
             _save_directory: Union[str, None] = pre_load_config.get('save_directory')
             _max_download_task: Union[int, None] = pre_load_config.get('max_tasks', {'download': 3}).get('download')
@@ -603,6 +631,8 @@ class UserConfig(BaseConfig):
             pre_load_config['temp_directory'] = PARSE_ARGS.temp
         pre_load_config['memory_download_limit'] = self.normalize_memory_download_limit(
             PARSE_ARGS.memory if PARSE_ARGS.memory is not None else _memory_download_limit)
+        pre_load_config['bot_admin_users'] = _bot_admin_users
+        pre_load_config['bot_allowed_users'] = _bot_allowed_users
         pre_load_config['video_filename_default_mode'] = _video_filename_default_mode
         pre_load_config['video_filename_prompt_timeout'] = _video_filename_prompt_timeout
         self.save_config(pre_load_config)  # v1.3.0 修复不保存配置文件时,配置文件仍然保存的问题。
