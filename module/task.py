@@ -20,7 +20,6 @@ from module.stdio import MetaData
 from module.parser import PARSE_ARGS
 from module.path_tool import (
     safe_delete,
-    calc_sha256,
 )
 from module.enums import (
     DownloadStatus,
@@ -59,7 +58,9 @@ class DownloadTask:
                 chat_id = getattr(getattr(message_ids, 'chat', None), 'id', None)
                 message_link = getattr(message_ids, 'link', None)
                 link = message_link if message_link else f'{chat_id}/{message_ids.id}'
-            DownloadTask(link=link, link_type=None, member_num=0, complete_num=0, file_name=set(), error_msg={})
+            retry = kwargs.get('retry') or (args[1] if len(args) > 1 else None)
+            if not retry or not retry.get('count') or link not in DownloadTask.LINK_INFO:
+                DownloadTask(link=link, link_type=None, member_num=0, complete_num=0, file_name=set(), error_msg={})
             res: dict = await func(self, *args, **kwargs)
             chat_id, link_type, member_num, status, e_code = res.values()
             if status == DownloadStatus.FAILURE:
@@ -86,8 +87,8 @@ class DownloadTask:
 
     def on_complete(func):
         @wraps(func)
-        def wrapper(self, *args, **kwargs):
-            res = func(self, *args, **kwargs)
+        async def wrapper(self, *args, **kwargs):
+            res = await func(self, *args, **kwargs)
             if all(i is None for i in res):
                 return None
             link, file_name = res
@@ -107,7 +108,8 @@ class DownloadTask:
                 )
                 DownloadTask.LINK_INFO.get(link)['error_msg'] = {}
                 DownloadTask.COMPLETE_LINK.add(link)
-                asyncio.create_task(self.done_notice(f'"{link}"下载完成。', link=link))
+                self.bot_task_link.discard(link)
+                self.create_background_task(self.done_notice(f'"{link}"下载完成。', link=link))
             return res
 
         return wrapper
@@ -165,7 +167,7 @@ class UploadTask:
         self.__media_group: asyncio.Task = media_group
         self.message_id: Optional[int] = message_id
         self.send_as_media_group: bool = send_as_media_group
-        self.sha256: str = calc_sha256(file_path=self.file_path)
+        self.sha256: str = ''  # Computed off the event loop before uploading.
         self.prompt: str = ''
 
     def __setattr__(self, name, value):

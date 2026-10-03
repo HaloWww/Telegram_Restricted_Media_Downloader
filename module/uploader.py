@@ -40,7 +40,8 @@ from module.stdio import (
 )
 from module.path_tool import (
     split_path,
-    safe_delete
+    safe_delete,
+    calc_sha256
 )
 from module.enums import (
     KeyWord,
@@ -60,6 +61,7 @@ class TelegramUploader:
             download_object
     ):
         self.app = download_object.app
+        self.create_background_task = download_object.create_background_task
         self.client: pyrogram.Client = self.app.client
         self.loop: asyncio.AbstractEventLoop = download_object.loop
         self.event: asyncio.Event = asyncio.Event()
@@ -73,7 +75,14 @@ class TelegramUploader:
         self.valid_link_cache = {}
         UploadTask.NOTIFY = download_object.done_notice
         UploadTask.DIRECTORY_NAME = os.path.join(UploadTask.DIRECTORY_NAME, str(download_object.my_id))
-        asyncio.create_task(self.send_media_worker())
+        self.media_group_poll_tasks = {}
+        self.worker = asyncio.create_task(self.send_media_worker())
+
+    async def stop(self):
+        tasks = [self.worker, *self.media_group_poll_tasks.values()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def resume_upload(
             self,
@@ -139,11 +148,13 @@ class TelegramUploader:
                 name=os.path.basename(path)
             )
         else:
-            md5_hash = hashlib.md5()
-            with open(path, 'rb') as f:
-                for chunk in iter(lambda: f.read(8192), b''):
-                    md5_hash.update(chunk)
-            md5_sum = ''.join([hex(i)[2:].zfill(2) for i in md5_hash.digest()])
+            def checksum():
+                md5_hash = hashlib.md5()
+                with open(path, 'rb') as f:
+                    for chunk in iter(lambda: f.read(8192), b''):
+                        md5_hash.update(chunk)
+                return md5_hash.hexdigest()
+            md5_sum = await asyncio.to_thread(checksum)
 
             file = raw.types.InputFile(
                 id=file_id,
@@ -198,7 +209,7 @@ class TelegramUploader:
         else:
             attributes = [raw.types.DocumentAttributeFilename(file_name=file_name)]
             if file_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
-                video_meta: Union[dict, None] = self.get_video_info(path)
+                video_meta: Union[dict, None] = await asyncio.to_thread(self.get_video_info, path)
                 if video_meta:
                     attributes.append(raw.types.DocumentAttributeVideo(
                         supports_streaming=True,
@@ -222,11 +233,11 @@ class TelegramUploader:
     async def send_media_worker(self):
         # 在函数内部使用本地缓存。
         media_group_cache = {}  # media_group_id -> {message_id: media, ...}
-        media_group_poll_tasks = {}  # media_group_id -> polling_task
+        media_group_poll_tasks = self.media_group_poll_tasks
 
         while self.is_bot_running:
+            media, upload_task = await self.upload_queue.get()
             try:
-                media, upload_task = await self.upload_queue.get()
 
                 log.info(
                     f'[Upload Worker]获取到上传任务,'
@@ -481,6 +492,12 @@ class TelegramUploader:
         else:
             chat_id: Union[int, str] = link
         file_path = upload_task.file_path
+        if not upload_task.sha256:
+            upload_task.sha256 = await asyncio.to_thread(calc_sha256, file_path)
+            if not upload_task.sha256:
+                upload_task.error_msg = '无法读取上传文件'
+                upload_task.status = UploadStatus.FAILURE
+                return
         file_size: int = os.path.getsize(file_path)
         upload_task.chat_id = chat_id
         if not is_allow_upload(file_size, self.is_premium):
@@ -578,6 +595,11 @@ class TelegramUploader:
     ):
         try:
             _ = _future.result()
+        except asyncio.CancelledError:
+            self.current_task_num = max(0, self.current_task_num - 1)
+            self.pb.progress.remove_task(task_id=task_id)
+            self.event.set()
+            return
         except Exception as e:
             self.current_task_num -= 1
             self.pb.progress.remove_task(task_id=task_id)
@@ -602,7 +624,7 @@ class TelegramUploader:
 
     def download_upload(self, with_upload: dict, file_path: str):
         if isinstance(with_upload, dict):
-            asyncio.create_task(
+            self.create_background_task(
                 self.create_upload_task(
                     link=with_upload.get('link'),
                     upload_task=UploadTask(

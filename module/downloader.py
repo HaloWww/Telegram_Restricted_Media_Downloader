@@ -10,6 +10,7 @@ import asyncio
 import datetime
 
 from functools import partial
+from contextlib import aclosing
 from sqlite3 import OperationalError
 from typing import Union, Callable, Optional, Dict, Set
 
@@ -109,18 +110,19 @@ class TelegramRestrictedMediaDownloader(Bot):
         super().__init__()
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
         self.event: asyncio.Event = asyncio.Event()
-        self.queue: asyncio.Queue = asyncio.Queue()
         self.app: Application = Application()
         self.memory_download_lock: asyncio.Lock = asyncio.Lock()
+        self.filename_prompt_lock: asyncio.Lock = asyncio.Lock()
         self.memory_download_used: int = 0
         self.video_filename_choice_counter: int = 0
-        self.video_filename_choices: Dict[str, asyncio.Future] = {}
+        self.video_filename_choices: Dict[str, dict] = {}
         self.active_download_task_counter: int = 0
         self.active_download_tasks: Dict[str, dict] = {}
         self.active_download_task_ids: Dict[asyncio.Task, str] = {}
         self.pending_download_tasks: Dict[str, dict] = {}
         self.cancelled_download_task_ids: Set[str] = set()
         self.download_task_semaphore: asyncio.Semaphore = asyncio.Semaphore(self.app.max_download_task)
+        self.download_path_locks: Dict[str, asyncio.Lock] = {}
         self.is_running: bool = False
         self.running_log: Set[bool] = set()
         self.running_log.add(self.is_running)
@@ -137,7 +139,7 @@ class TelegramRestrictedMediaDownloader(Bot):
         return [
             (task_id, task_meta)
             for task_id, task_meta in sorted(self.active_download_tasks.items(), key=lambda item: int(item[0]))
-            if task_meta.get('task') and not task_meta.get('task').done() and self.__is_download_task_visible(
+            if task_meta.get('task') and self.__is_download_task_visible(
                 task_meta, request_user_id)
         ]
 
@@ -185,54 +187,47 @@ class TelegramRestrictedMediaDownloader(Bot):
         text += f'链接:{self.__short_text(task_meta.get("link"), 120)}'
         return text
 
-    def __download_task_list_keyboard(self, request_user_id: Union[int, None] = None) -> InlineKeyboardMarkup:
+    def __download_task_page(self, request_user_id=None, page=0):
+        pending = self.__get_pending_download_tasks(request_user_id)
+        active = self.__get_active_download_tasks(request_user_id)
+        tasks = [(task_id, meta, False) for task_id, meta in pending]
+        tasks += [(task_id, meta, True) for task_id, meta in active]
+        page_size = 6
+        pages = max(1, (len(tasks) + page_size - 1) // page_size)
+        page = min(max(0, page), pages - 1)
+        visible = tasks[page * page_size:(page + 1) * page_size]
+        text = f'📥下载任务:等待 {len(pending)},运行 {len(active)} (第{page + 1}/{pages}页)'
         keyboard = []
-        for task_id, task_meta in self.__get_pending_download_tasks(request_user_id):
-            if task_meta.get('cancel_requested'):
-                continue
-            keyboard.append([
-                InlineKeyboardButton(
+        for task_id, meta, running in visible:
+            formatter = self.__format_active_download_task if running else self.__format_pending_download_task
+            text += '\n\n' + formatter(task_id, meta)
+            if not meta.get('cancel_requested'):
+                keyboard.append([InlineKeyboardButton(
                     text=f'{BotButton.CANCEL_TASK} #{task_id}',
-                    callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:{task_id}'
-                )
-            ])
-        for task_id, task_meta in self.__get_active_download_tasks(request_user_id):
-            if task_meta.get('cancel_requested'):
-                continue
-            keyboard.append([
-                InlineKeyboardButton(
-                    text=f'{BotButton.CANCEL_TASK} #{task_id}',
-                    callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:{task_id}'
-                )
-            ])
+                    callback_data=f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:{task_id}')])
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton('⬅️上一页', callback_data=f'{BotCallbackText.DOWNLOAD_TASKS}:{page - 1}'))
+        if page + 1 < pages:
+            navigation.append(InlineKeyboardButton('下一页➡️', callback_data=f'{BotCallbackText.DOWNLOAD_TASKS}:{page + 1}'))
+        if navigation:
+            keyboard.append(navigation)
         keyboard.append([
-            InlineKeyboardButton(text='🔄刷新', callback_data=BotCallbackText.DOWNLOAD_TASKS),
-            InlineKeyboardButton(text=BotButton.HELP_PAGE, callback_data=BotCallbackText.BACK_HELP)
-        ])
-        return InlineKeyboardMarkup(keyboard)
+            InlineKeyboardButton('🔄刷新', callback_data=f'{BotCallbackText.DOWNLOAD_TASKS}:{page}'),
+            InlineKeyboardButton(BotButton.HELP_PAGE, callback_data=BotCallbackText.BACK_HELP)])
+        if not tasks:
+            text = '📥当前没有正在下载的任务。'
+        return text, InlineKeyboardMarkup(keyboard)
 
-    async def __show_active_download_tasks(self, callback_query: pyrogram.types.CallbackQuery) -> None:
-        request_user_id = callback_query.from_user.id
-        pending_tasks = self.__get_pending_download_tasks(request_user_id)
-        active_tasks = self.__get_active_download_tasks(request_user_id)
-        text_parts = []
-        if pending_tasks:
-            text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
-                self.__format_pending_download_task(task_id, task_meta)
-                for task_id, task_meta in pending_tasks
-            ))
-        if active_tasks:
-            text_parts.append('📥正在下载:\n\n' + '\n\n'.join(
-                self.__format_active_download_task(task_id, task_meta)
-                for task_id, task_meta in active_tasks
-            ))
-        text = '\n\n'.join(text_parts) if text_parts else '📥当前没有正在下载的任务。'
+    def __download_task_list_keyboard(self, request_user_id=None):
+        return self.__download_task_page(request_user_id)[1]
+
+    async def __show_active_download_tasks(self, callback_query, page=0) -> None:
+        text, keyboard = self.__download_task_page(callback_query.from_user.id, page)
         try:
             await callback_query.message.edit_text(
-                text=safe_message(text)[0],
-                reply_markup=self.__download_task_list_keyboard(request_user_id),
-                link_preview_options=LINK_PREVIEW_OPTIONS
-            )
+                text=text, reply_markup=keyboard, parse_mode=ParseMode.DISABLED,
+                link_preview_options=LINK_PREVIEW_OPTIONS)
         except MessageNotModified:
             pass
 
@@ -347,6 +342,9 @@ class TelegramRestrictedMediaDownloader(Bot):
                 self.pending_download_tasks.pop(task_id, None)
                 task_meta['cancel_requested'] = True
                 self.cancelled_download_task_ids.add(task_id)
+                pending_task = task_meta.get('task')
+                if pending_task:
+                    pending_task.cancel()
                 self.bot_task_link.discard(task_meta.get('link'))
                 try:
                     await callback_query.message.edit_text(
@@ -483,7 +481,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             return default_mode
         finally:
             self.video_filename_choices.pop(token, None)
-            if prompt_message:
+            if prompt_message and not future.cancelled():
                 try:
                     selected_mode = future.result() if future.done() and not future.cancelled() else default_mode
                     await prompt_message.edit_text(
@@ -605,7 +603,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             'cancel_requested': False
         }
         self.bot_task_link.add(link)
-        self.loop.create_task(
+        task = self.create_background_task(
             self.__run_queued_download_task(
                 task_id=task_id,
                 link=link,
@@ -617,6 +615,15 @@ class TelegramRestrictedMediaDownloader(Bot):
                 last_bot_message=last_bot_message
             )
         )
+        self.pending_download_tasks[task_id]['task'] = task
+        task.add_done_callback(lambda done: self.__finish_pending_request(task_id, done))
+
+    def __finish_pending_request(self, task_id, task):
+        meta = self.pending_download_tasks.get(task_id)
+        if meta and meta.get('task') is task:
+            self.pending_download_tasks.pop(task_id, None)
+        if task.cancelled():
+            self.cancelled_download_task_ids.discard(task_id)
 
     async def __run_queued_download_task(
             self,
@@ -633,11 +640,8 @@ class TelegramRestrictedMediaDownloader(Bot):
         if not task_meta or task_meta.get('cancel_requested') or self.__is_tracked_download_cancelled(task_id):
             self.cancelled_download_task_ids.discard(task_id)
             return None
-        task_meta['status'] = '等待空位'
-        slot_acquired = False
+        task_meta['status'] = '准备中'
         try:
-            await self.download_task_semaphore.acquire()
-            slot_acquired = True
             if task_meta.get('cancel_requested') or self.__is_tracked_download_cancelled(task_id):
                 return None
             task_meta['status'] = '准备中'
@@ -649,17 +653,16 @@ class TelegramRestrictedMediaDownloader(Bot):
                 client=client,
                 message=message,
                 last_bot_message=last_bot_message,
-                track_task_id=task_id,
-                download_slot_acquired=True
+                track_task_id=task_id
             )
         except Exception as e:
             log.exception(f'后台分配下载任务失败,{_t(KeyWord.REASON)}:"{e}"')
             self.bot_task_link.discard(link)
         finally:
-            if slot_acquired and not task_meta.get('slot_owned_by_active_task'):
-                self.download_task_semaphore.release()
-            self.pending_download_tasks.pop(task_id, None)
-            self.cancelled_download_task_ids.discard(task_id)
+            current_meta = self.pending_download_tasks.get(task_id)
+            if current_meta and current_meta.get('task') is asyncio.current_task():
+                self.pending_download_tasks.pop(task_id, None)
+                self.cancelled_download_task_ids.discard(task_id)
 
     async def __create_download_tasks_from_bot(
             self,
@@ -671,8 +674,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             message: pyrogram.types.Message,
             last_bot_message: Union[pyrogram.types.Message, None],
             with_upload: Union[dict, None] = None,
-            track_task_id: Union[str, None] = None,
-            download_slot_acquired: bool = False
+            track_task_id: Union[str, None] = None
     ) -> None:
         for link in links:
             if not with_upload and not track_task_id:
@@ -683,8 +685,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                 with_upload=with_upload,
                 request_client=client,
                 request_message=message,
-                track_task_id=track_task_id,
-                download_slot_acquired=download_slot_acquired
+                track_task_id=track_task_id
             )
             if self.__is_tracked_download_cancelled(track_task_id):
                 self.bot_task_link.discard(link)
@@ -974,27 +975,12 @@ class TelegramRestrictedMediaDownloader(Bot):
                 link_preview_options=LINK_PREVIEW_OPTIONS
             )
             return None
-        pending_tasks = self.__get_pending_download_tasks(request_user_id)
-        active_tasks = self.__get_active_download_tasks(request_user_id)
-        text_parts = []
-        if pending_tasks:
-            text_parts.append('⏳等待下载:\n\n' + '\n\n'.join(
-                self.__format_pending_download_task(task_id, task_meta)
-                for task_id, task_meta in pending_tasks
-            ))
-        if active_tasks:
-            text_parts.append('📥正在下载:\n\n' + '\n\n'.join(
-                self.__format_active_download_task(task_id, task_meta)
-                for task_id, task_meta in active_tasks
-            ))
-        text = '\n\n'.join(text_parts) if text_parts else '📥当前没有正在下载的任务。'
+        text, keyboard = self.__download_task_page(request_user_id)
         await client.send_message(
-            chat_id=message.from_user.id,
+            chat_id=request_user_id,
             reply_parameters=ReplyParameters(message_id=message.id),
-            text=safe_message(text)[0],
-            reply_markup=self.__download_task_list_keyboard(request_user_id),
-            link_preview_options=LINK_PREVIEW_OPTIONS
-        )
+            text=text, reply_markup=keyboard, parse_mode=ParseMode.DISABLED,
+            link_preview_options=LINK_PREVIEW_OPTIONS)
 
     async def callback_data(self, client: pyrogram.Client, callback_query: pyrogram.types.CallbackQuery):
         callback_data = await super().callback_data(client, callback_query)
@@ -1003,6 +989,7 @@ class TelegramRestrictedMediaDownloader(Bot):
             return None
         public_callback = (
                 callback_data == BotCallbackText.DOWNLOAD_TASKS or
+                callback_data.startswith(f'{BotCallbackText.DOWNLOAD_TASKS}:') or
                 callback_data == BotCallbackText.PAY or
                 callback_data == BotCallbackText.BACK_HELP or
                 callback_data.startswith(f'{self.VIDEO_FILENAME_CALLBACK_PREFIX}:') or
@@ -1043,8 +1030,12 @@ class TelegramRestrictedMediaDownloader(Bot):
             except Exception as e:
                 log.warning(f'处理视频命名选择失败,{_t(KeyWord.REASON)}:"{e}"')
             return None
-        elif callback_data == BotCallbackText.DOWNLOAD_TASKS:
-            await self.__show_active_download_tasks(callback_query)
+        elif callback_data == BotCallbackText.DOWNLOAD_TASKS or callback_data.startswith(f'{BotCallbackText.DOWNLOAD_TASKS}:'):
+            try:
+                page = int(callback_data.split(':', 1)[1]) if ':' in callback_data else 0
+            except ValueError:
+                page = 0
+            await self.__show_active_download_tasks(callback_query, page)
         elif callback_data.startswith(f'{BotCallbackText.DOWNLOAD_TASK_CANCEL}:'):
             task_id = callback_data.split(':', 1)[1]
             await self.__confirm_cancel_download_task(callback_query, task_id)
@@ -2341,150 +2332,119 @@ class TelegramRestrictedMediaDownloader(Bot):
             log.error(f'获取原始消息失败,{_t(KeyWord.REASON)}:"{e}"')
             await last_message.edit_text(text=f'❌❌❌无法创建下载任务`{message_id}`❌❌❌\n{e}')
 
+    @staticmethod
+    async def __disk_call(function, *args, **kwargs):
+        # Cancellation must wait for an in-flight write before closing its file.
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+            operation.result()
+            raise
+
     async def resume_download(
-            self,
-            message: pyrogram.types.Message,
-            file_name: str,
-            progress: Callable = None,
-            progress_args: tuple = (),
-            chunk_size: int = 1024 * 1024,
-            compare_size: Union[int, None] = None,  # 不为None时,将通过大小比对判断是否为完整文件。
-            download_client: Optional[pyrogram.Client] = None
-    ) -> str:
+            self, message, file_name: str, progress: Callable = None,
+            progress_args: tuple = (), chunk_size: int = 1024 * 1024,
+            compare_size: Union[int, None] = None,
+            download_client: Optional[pyrogram.Client] = None) -> str:
         download_client = download_client or self.app.client
         temp_path = f'{file_name}.temp'
-        if os.path.exists(file_name) and compare_size:
-            local_file_size: int = get_file_size(file_path=file_name)
-            if compare_file_size(a_size=local_file_size, b_size=compare_size):
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.RESUME)}:"{file_name}",'
-                    f'{_t(KeyWord.STATUS)}:{_t(KeyWord.ALREADY_EXIST)}')
+        for existing in (file_name, temp_path):
+            if not await self.__disk_call(os.path.exists, existing):
+                continue
+            size = await self.__disk_call(os.path.getsize, existing)
+            if compare_size is not None and size == compare_size:
+                if existing == temp_path:
+                    result = await self.__disk_call(safe_replace, temp_path, file_name)
+                    if result.get('e_code'):
+                        raise OSError(result['e_code'])
                 return file_name
-            else:
-                result: str = safe_replace(origin_file=file_name, overwrite_file=temp_path).get('e_code')
-                log.warning(result) if result is not None else None
-                log.warning(
-                    f'不完整的文件"{file_name}",'
-                    f'更改文件名作为缓存:[{file_name}]({get_file_size(file_name)}) -> [{temp_path}]({compare_size})。')
-        if os.path.exists(temp_path) and compare_size:
-            local_file_size: int = get_file_size(file_path=temp_path)
-            if compare_file_size(a_size=local_file_size, b_size=compare_size):
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.RESUME)}:"{temp_path}",'
-                    f'{_t(KeyWord.STATUS)}:{_t(KeyWord.ALREADY_EXIST)}')
-                result: str = safe_replace(origin_file=temp_path, overwrite_file=file_name).get('e_code')
-                log.warning(result) if result is not None else None
-                return file_name
-            elif local_file_size > compare_size:
-                safe_delete(temp_path)
-                log.warning(
-                    f'错误的缓存文件"{temp_path}",'
-                    f'已清除({_t(KeyWord.ERROR_SIZE)}:{local_file_size} > {_t(KeyWord.ACTUAL_SIZE)}:{compare_size})。')
-        downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0  # 获取已下载的字节数。
-        if downloaded == 0:
-            mode = 'wb'
-        else:
-            mode = 'r+b'
-            console.log(
-                f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                f'{_t(KeyWord.RESUME)}:"{file_name}",'
-                f'{_t(KeyWord.ERROR_SIZE)}:{MetaData.suitable_units_display(downloaded)}。')
-        with open(file=temp_path, mode=mode) as f:
-            skip_chunks: int = downloaded // chunk_size  # 计算要跳过的块数。
-            f.seek(downloaded)
+            if existing == file_name:
+                result = await self.__disk_call(safe_replace, file_name, temp_path)
+                if result.get('e_code'):
+                    raise OSError(result['e_code'])
+            elif compare_size is not None and size > compare_size:
+                await self.__disk_call(safe_delete, temp_path)
+        downloaded = await self.__disk_call(get_file_size, temp_path)
+        # stream_media offsets are whole MiB chunks. Discard a partial tail.
+        downloaded = downloaded // chunk_size * chunk_size
+        f = await self.__disk_call(open, temp_path, 'r+b' if os.path.exists(temp_path) else 'wb')
+        try:
+            await self.__disk_call(f.truncate, downloaded)
+            await self.__disk_call(f.seek, downloaded)
             while True:
                 try:
-                    async for chunk in download_client.stream_media(message=message, offset=skip_chunks):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        progress(downloaded, *progress_args)
+                    async with aclosing(download_client.stream_media(
+                            message=message, offset=downloaded // chunk_size)) as stream:
+                        async for chunk in stream:
+                            await self.__disk_call(f.write, chunk)
+                            downloaded += len(chunk)
+                            if progress:
+                                progress(downloaded, *progress_args)
                     break
-                except FileReferenceExpired as e:
-                    log.warning(
-                        f'文件引用已过期,正在重新获取消息以刷新引用,{_t(KeyWord.REASON)}:"{e}"')
-                    chat_id = message.chat.id
-                    message_id = message.id
-                    try:
-                        message = await download_client.get_messages(chat_id=chat_id, message_ids=message_id)
-                        skip_chunks: int = downloaded // chunk_size
-                        f.seek(downloaded)
-                    except Exception as refresh_error:
-                        log.error(f'重新获取消息失败,{_t(KeyWord.REASON)}:"{refresh_error}"')
-                        break
-                except (FloodWait, FloodPremiumWait) as e:
-                    amount = e.value
-                    console.log(
-                        f'[{download_client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
-                        style='#FF4689'
-                    )
-                    await asyncio.sleep(amount)
-        if compare_size is None or compare_file_size(a_size=downloaded, b_size=compare_size):
-            result: str = safe_replace(origin_file=temp_path, overwrite_file=file_name).get('e_code')
-            log.warning(result) if result is not None else None
-            log.info(
-                f'"{temp_path}"下载完成,更改文件名:[{temp_path}]({get_file_size(temp_path)}) -> [{file_name}]({compare_size})')
+                except FileReferenceExpired:
+                    message = await download_client.get_messages(
+                        chat_id=message.chat.id, message_ids=message.id)
+                except (FloodWait, FloodPremiumWait) as error:
+                    await asyncio.sleep(error.value)
+                # Reopen the stream at the current offset after every retry.
+                downloaded = downloaded // chunk_size * chunk_size
+                await self.__disk_call(f.truncate, downloaded)
+                await self.__disk_call(f.seek, downloaded)
+        finally:
+            await self.__disk_call(f.close)
+        if compare_size is None or downloaded == compare_size:
+            result = await self.__disk_call(safe_replace, temp_path, file_name)
+            if result.get('e_code'):
+                raise OSError(result['e_code'])
         return file_name
 
     async def memory_download(
-            self,
-            message: pyrogram.types.Message,
-            save_file_path: str,
-            progress: Callable = None,
-            progress_args: tuple = (),
-            chunk_size: int = 1024 * 1024,
+            self, message, save_file_path: str, progress: Callable = None,
+            progress_args: tuple = (), chunk_size: int = 1024 * 1024,
             compare_size: Union[int, None] = None,
-            download_client: Optional[pyrogram.Client] = None
-    ) -> Union[str, None]:
-        """将小文件下载到内存,完成后一次性写入最终保存目录。"""
+            download_client: Optional[pyrogram.Client] = None) -> Union[str, None]:
         download_client = download_client or self.app.client
-        downloaded: int = 0
-        skip_chunks: int = 0
         buffer = bytearray()
         while True:
             try:
-                async for chunk in download_client.stream_media(message=message, offset=skip_chunks):
-                    if self.app.memory_download_limit_bytes and downloaded + len(chunk) > self.app.memory_download_limit_bytes:
-                        log.warning(f'内存下载超过上限:{self.app.memory_download_limit}MB,已取消本次内存下载。')
-                        return None
-                    downloaded += len(chunk)
-                    buffer.extend(chunk)
-                    if progress:
-                        progress(downloaded, *progress_args)
+                async with aclosing(download_client.stream_media(
+                        message=message, offset=len(buffer) // chunk_size)) as stream:
+                    async for chunk in stream:
+                        if self.app.memory_download_limit_bytes and len(buffer) + len(chunk) > self.app.memory_download_limit_bytes:
+                            return None
+                        buffer.extend(chunk)
+                        if progress:
+                            progress(len(buffer), *progress_args)
                 break
-            except FileReferenceExpired as e:
-                log.warning(f'文件引用已过期,正在重新获取消息以刷新引用,{_t(KeyWord.REASON)}:"{e}"')
-                try:
-                    message = await download_client.get_messages(chat_id=message.chat.id, message_ids=message.id)
-                    skip_chunks = downloaded // chunk_size
-                except Exception as refresh_error:
-                    log.error(f'重新获取消息失败,{_t(KeyWord.REASON)}:"{refresh_error}"')
-                    return None
-            except (FloodWait, FloodPremiumWait) as e:
-                amount = e.value
-                console.log(
-                    f'[{download_client.name}]下载请求频繁,要求等待{amount}秒后继续运行。',
-                    style='#FF4689'
-                )
-                await asyncio.sleep(amount)
-        if compare_size is not None and not compare_file_size(a_size=downloaded, b_size=compare_size):
+            except FileReferenceExpired:
+                message = await download_client.get_messages(
+                    chat_id=message.chat.id, message_ids=message.id)
+            except (FloodWait, FloodPremiumWait) as error:
+                await asyncio.sleep(error.value)
+            del buffer[len(buffer) // chunk_size * chunk_size:]
+        if compare_size is not None and len(buffer) != compare_size:
             return None
-        save_parent: str = split_path(save_file_path).get('directory') or os.getcwd()
-        try:
-            os.makedirs(save_parent, exist_ok=True)
+        def save():
+            os.makedirs(os.path.dirname(save_file_path) or os.getcwd(), exist_ok=True)
             if os.path.exists(save_file_path):
-                if compare_size is not None and compare_file_size(get_file_size(save_file_path), compare_size):
+                if compare_size is not None and get_file_size(save_file_path) == compare_size:
                     return save_file_path
-                log.warning(f'"{save_file_path}"已存在且大小不一致,内存下载结果未写入。')
                 return None
-            with open(file=save_file_path, mode='xb') as f:
-                f.write(buffer)
-            log.info(f'内存下载完成,已写入:"{save_file_path}"({downloaded})。')
+            try:
+                with open(save_file_path, 'xb') as f:
+                    f.write(buffer)
+            except BaseException:
+                # An incomplete final file must never look like a completed download.
+                safe_delete(save_file_path)
+                raise
             return save_file_path
-        except Exception as e:
-            log.error(f'内存下载写入"{save_file_path}"失败,{_t(KeyWord.REASON)}:"{e}"')
-            return None
+        return await self.__disk_call(save)
 
     def get_media_meta(
             self,
@@ -2521,211 +2481,269 @@ class TelegramRestrictedMediaDownloader(Bot):
             request_client: Optional[pyrogram.Client] = None,
             request_message: Optional[pyrogram.types.Message] = None,
             track_task_id: Union[str, None] = None,
-            download_slot_acquired: bool = False,
+            download_client: Optional[pyrogram.Client] = None
+    ) -> None:
+        if self.__is_tracked_download_cancelled(track_task_id):
+            return
+        if isinstance(message, list):
+            members = [m for m in message if retry.get('count', 0) == 0 or m.id == retry.get('id')]
+            for index, member in enumerate(members):
+                await self.__add_task(
+                    chat_id, link_type, link, member, dict(retry), with_upload, diy_download_type,
+                    request_client, request_message, track_task_id if index == 0 else None,
+                    download_client)
+            return
+        task_id = track_task_id or self.__next_active_download_task_id()
+        task_meta = self.pending_download_tasks.setdefault(task_id, {
+            'link': link,
+            'status': '准备中',
+            'request_user_id': getattr(getattr(request_message, 'from_user', None), 'id', None),
+            'cancel_requested': False
+        })
+        task = self.create_background_task(self.__run_download_preparation(
+            task_id, task_meta, chat_id, link_type, link, message, dict(retry),
+            dict(with_upload) if with_upload else None, diy_download_type,
+            request_client, request_message, download_client))
+        task_meta['task'] = task
+        task.add_done_callback(lambda _: self.__finish_preparation(task_id, task_meta))
+
+    def __finish_preparation(self, task_id, task_meta):
+        if not task_meta.get('slot_owned_by_active_task'):
+            path_lock = task_meta.pop('path_lock', None)
+            if path_lock:
+                path_lock.release()
+            if task_meta.pop('slot_acquired', False):
+                self.download_task_semaphore.release()
+            if task_meta.get('memory_reserved'):
+                self.__release_memory_download(task_meta.pop('memory_reserved'))
+        if self.pending_download_tasks.get(task_id) is task_meta:
+            self.pending_download_tasks.pop(task_id, None)
+        self.cancelled_download_task_ids.discard(task_id)
+
+    async def __run_download_preparation(
+            self, task_id, task_meta, chat_id, link_type, link, message, retry,
+            with_upload, diy_download_type, request_client, request_message, download_client):
+        try:
+            if task_meta.get('cancel_requested'):
+                return
+            await self.__prepare_download_task(
+                chat_id, link_type, link, message, retry, with_upload, diy_download_type,
+                request_client, request_message, task_id, download_client)
+        except asyncio.CancelledError:
+            self.bot_task_link.discard(link)
+            raise
+        except Exception as error:
+            DownloadTask.set_error(link=link, value=str(error))
+            self.bot_task_link.discard(link)
+            raise
+        finally:
+            self.__finish_preparation(task_id, task_meta)
+
+    async def __prepare_download_task(
+            self,
+            chat_id: Union[str, int],
+            link_type: str,
+            link: str,
+            message: Union[pyrogram.types.Message, list],
+            retry: dict,
+            with_upload: Optional[dict] = None,
+            diy_download_type: Optional[list] = None,
+            request_client: Optional[pyrogram.Client] = None,
+            request_message: Optional[pyrogram.types.Message] = None,
+            track_task_id: Union[str, None] = None,
             download_client: Optional[pyrogram.Client] = None
     ) -> None:
         retry_count = retry.get('count')
-        retry_id = retry.get('id')
-        if self.__is_tracked_download_cancelled(track_task_id):
-            return None
-        if isinstance(message, list):
-            for index, _message in enumerate(message):
-                child_track_task_id = track_task_id if index == 0 else None
-                if retry_count != 0:
-                    if _message.id == retry_id:
-                        await self.__add_task(
-                            chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                            request_client, request_message, track_task_id, download_slot_acquired, download_client)
-                        break
-                else:
-                    child_download_slot_acquired = download_slot_acquired if child_track_task_id else False
-                    await self.__add_task(
-                        chat_id, link_type, link, _message, retry, with_upload, diy_download_type,
-                        request_client, request_message, child_track_task_id, child_download_slot_acquired, download_client)
-        else:
-            _task = None
-            valid_dtype: str = next((_ for _ in DownloadType() if getattr(message, _, None)), None)  # 判断该链接是否为有支持的类型。
-            download_type: list = diy_download_type if diy_download_type else self.app.download_type
-            if valid_dtype in download_type:
-                # 如果是匹配到的消息类型就创建任务。
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.CHANNEL)}:"{chat_id}",'  # 频道名。
-                    f'{_t(KeyWord.LINK)}:"{link}",'  # 链接。
-                    f'{_t(KeyWord.LINK_TYPE)}:{_t(link_type)}。'  # 链接类型。
+        _task = None
+        valid_dtype: str = next((_ for _ in DownloadType() if getattr(message, _, None)), None)  # 判断该链接是否为有支持的类型。
+        download_type: list = diy_download_type if diy_download_type else self.app.download_type
+        if valid_dtype in download_type:
+            # 如果是匹配到的消息类型就创建任务。
+            console.log(
+                f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                f'{_t(KeyWord.CHANNEL)}:"{chat_id}",'  # 频道名。
+                f'{_t(KeyWord.LINK)}:"{link}",'  # 链接。
+                f'{_t(KeyWord.LINK_TYPE)}:{_t(link_type)}。'  # 链接类型。
+            )
+            if track_task_id in self.pending_download_tasks:
+                self.pending_download_tasks[track_task_id]['status'] = '准备命名'
+            video_filename_mode = retry.get('video_filename_mode')
+            if video_filename_mode not in ('new', 'old'):
+                video_filename_mode = await self.__choose_video_filename_mode(
+                    message=message,
+                    dtype=valid_dtype,
+                    request_client=request_client,
+                    request_message=request_message
                 )
-                if track_task_id in self.pending_download_tasks:
-                    self.pending_download_tasks[track_task_id]['status'] = '准备命名'
-                video_filename_mode = retry.get('video_filename_mode')
-                if video_filename_mode not in ('new', 'old'):
-                    video_filename_mode = await self.__choose_video_filename_mode(
-                        message=message,
-                        dtype=valid_dtype,
-                        request_client=request_client,
-                        request_message=request_message
-                    )
-                    retry['video_filename_mode'] = video_filename_mode
-                file_id, temp_file_path, sever_file_size, file_name, save_directory, format_file_size = \
-                    self.get_media_meta(
-                        message=message,
-                        dtype=valid_dtype,
-                        video_filename_mode=video_filename_mode).values()
-                retry['id'] = file_id
-                if track_task_id in self.pending_download_tasks:
-                    self.pending_download_tasks[track_task_id].update(
-                        {
-                            'status': '准备下载',
-                            'file_name': file_name,
-                            'file_size': sever_file_size,
-                            'total': sever_file_size,
-                            'downloaded': 0
-                        }
-                    )
+                retry['video_filename_mode'] = video_filename_mode
+            # Serialize terminal prompts and keep their timed input off the loop.
+            async with self.filename_prompt_lock:
+                media_meta = await self.__disk_call(
+                    self.get_media_meta, message=message, dtype=valid_dtype,
+                    video_filename_mode=video_filename_mode)
+            file_id, temp_file_path, sever_file_size, file_name, save_directory, format_file_size = media_meta.values()
+            retry['id'] = file_id
+            if track_task_id in self.pending_download_tasks:
+                self.pending_download_tasks[track_task_id].update(
+                    {
+                        'status': '准备下载',
+                        'file_name': file_name,
+                        'file_size': sever_file_size,
+                        'total': sever_file_size,
+                        'downloaded': 0
+                    }
+                )
+            if self.__is_tracked_download_cancelled(track_task_id):
+                return None
+            pending_meta = self.pending_download_tasks[track_task_id]
+            pending_meta['status'] = '等待文件'
+            path_key = os.path.normcase(os.path.abspath(save_directory))
+            path_lock = self.download_path_locks.setdefault(path_key, asyncio.Lock())
+            await path_lock.acquire()
+            pending_meta['path_lock'] = path_lock
+            if await self.__disk_call(is_file_duplicate,
+                    save_directory=save_directory,
+                    sever_file_size=sever_file_size
+            ):  # 检测是否存在。
+                await self.download_complete_callback(
+                    sever_file_size=sever_file_size,
+                    temp_file_path=temp_file_path,
+                    link=link,
+                    message=message,
+                    file_name=file_name,
+                    retry_count=retry_count,
+                    file_id=file_id,
+                    format_file_size=format_file_size,
+                    task_id=None,
+                    with_upload=with_upload,
+                    diy_download_type=diy_download_type,
+                    request_client=request_client,
+                    request_message=request_message,
+                    download_client=download_client,
+                    _future=save_directory
+                )
+            else:
+                self.pending_download_tasks[track_task_id]['status'] = '等待空位'
+                await self.download_task_semaphore.acquire()
+                self.pending_download_tasks[track_task_id]['slot_acquired'] = True
                 if self.__is_tracked_download_cancelled(track_task_id):
                     return None
-                if is_file_duplicate(
-                        save_directory=save_directory,
-                        sever_file_size=sever_file_size
-                ):  # 检测是否存在。
-                    self.download_complete_callback(
-                        sever_file_size=sever_file_size,
-                        temp_file_path=temp_file_path,
-                        link=link,
-                        message=message,
-                        file_name=file_name,
-                        retry_count=retry_count,
-                        file_id=file_id,
-                        format_file_size=format_file_size,
-                        task_id=None,
-                        with_upload=with_upload,
-                        diy_download_type=diy_download_type,
-                        request_client=request_client,
-                        request_message=request_message,
-                        download_client=download_client,
-                        _future=save_directory
-                    )
+                memory_download: bool = await self.__reserve_memory_download(sever_file_size)
+                self.pending_download_tasks[track_task_id]['memory_reserved'] = sever_file_size if memory_download else 0
+                task_id = self.pb.progress.add_task(
+                    description='📥',
+                    filename=truncate_display_filename(file_name),
+                    info=f'0.00B/{format_file_size}',
+                    total=sever_file_size
+                )
+                active_task_id = track_task_id or self.__next_active_download_task_id()
+                tracked_task_meta = self.pending_download_tasks.get(track_task_id)
+                self.pending_download_tasks.pop(active_task_id, None)
+                self.active_download_tasks[active_task_id] = {
+                    'task': None,
+                    'link': link,
+                    'request_user_id': getattr(getattr(request_message, 'from_user', None), 'id', None),
+                    'request_client': request_client,
+                    'request_message': request_message,
+                    'download_client': download_client,
+                    'chat_id': chat_id,
+                    'message_id': file_id,
+                    'file_name': file_name,
+                    'file_size': sever_file_size,
+                    'total': sever_file_size,
+                    'downloaded': 0,
+                    'cancel_requested': False,
+                    'memory_download': memory_download
+                }
+                self.active_download_tasks[active_task_id]['path_lock'] = path_lock
+                download_func: Callable = self.memory_download if memory_download else self.resume_download
+                download_kwargs: dict = {
+                    'message': message,
+                    'progress': self.__download_progress,
+                    'progress_args': (
+                        sever_file_size,
+                        self.pb.progress,
+                        task_id,
+                        active_task_id
+                    ),
+                    'compare_size': sever_file_size
+                }
+                download_kwargs['download_client'] = download_client or self.app.client
+                if memory_download:
+                    download_kwargs['save_file_path'] = save_directory
                 else:
-                    if not download_slot_acquired:
-                        await self.download_task_semaphore.acquire()
-                    if self.__is_tracked_download_cancelled(track_task_id):
-                        if not download_slot_acquired:
-                            self.download_task_semaphore.release()
-                        return None
-                    memory_download: bool = await self.__reserve_memory_download(sever_file_size)
+                    download_kwargs['file_name'] = temp_file_path
+                _task = self.create_background_task(
+                    download_func(
+                        **download_kwargs
+                    )
+                )
+                self.active_download_tasks[active_task_id]['task'] = _task
+                self.active_download_task_ids[_task] = active_task_id
+                _task.add_done_callback(
+                    partial(
+                        self.__schedule_download_completion,
+                        sever_file_size,
+                        temp_file_path,
+                        link,
+                        message,
+                        file_name,
+                        retry_count,
+                        file_id,
+                        format_file_size,
+                        task_id,
+                        with_upload,
+                        diy_download_type,
+                        request_client,
+                        request_message,
+                        download_client,
+                        video_filename_mode=video_filename_mode,
+                        memory_download=memory_download
+                    )
+                )
+                if tracked_task_meta is not None:
+                    tracked_task_meta['slot_owned_by_active_task'] = True
+                console.log(
+                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                    f'{_t(KeyWord.FILE)}:"{file_name}",'
+                    f'{_t(KeyWord.SIZE)}:{format_file_size},'
+                    f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.DOWNLOADING))},'
+                    f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.DOWNLOADING)}。'
+                )
+                if memory_download:
+                    log.info(
+                        f'启用内存下载:"{file_name}",大小:{format_file_size},'
+                        f'内存上限:{self.app.memory_download_limit}MB。')
+                MetaData.print_current_task_num(
+                    prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
+                    num=self.app.current_task_num
+                )
+        else:
+            _error = '不支持或被忽略的类型(已取消)。'
+            try:
+                _, __, ___, file_name, ____, format_file_size = self.get_media_meta(
+                    message=message,
+                    dtype=valid_dtype
+                ).values()
+                if file_name:
                     console.log(
                         f'{_t(KeyWord.DOWNLOAD_TASK)}'
                         f'{_t(KeyWord.FILE)}:"{file_name}",'
                         f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.DOWNLOADING))},'
-                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.DOWNLOADING)}。'
+                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.SKIP))},'
+                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SKIP)}。'
                     )
-                    task_id = self.pb.progress.add_task(
-                        description='📥',
-                        filename=truncate_display_filename(file_name),
-                        info=f'0.00B/{format_file_size}',
-                        total=sever_file_size
-                    )
-                    active_task_id = track_task_id or self.__next_active_download_task_id()
-                    tracked_task_meta = self.pending_download_tasks.get(track_task_id)
-                    self.pending_download_tasks.pop(active_task_id, None)
-                    self.active_download_tasks[active_task_id] = {
-                        'task': None,
-                        'link': link,
-                        'request_user_id': getattr(getattr(request_message, 'from_user', None), 'id', None),
-                        'request_client': request_client,
-                        'request_message': request_message,
-                        'download_client': download_client,
-                        'chat_id': chat_id,
-                        'message_id': file_id,
-                        'file_name': file_name,
-                        'file_size': sever_file_size,
-                        'total': sever_file_size,
-                        'downloaded': 0,
-                        'cancel_requested': False,
-                        'memory_download': memory_download
-                    }
-                    download_func: Callable = self.memory_download if memory_download else self.resume_download
-                    download_kwargs: dict = {
-                        'message': message,
-                        'progress': self.__download_progress,
-                        'progress_args': (
-                            sever_file_size,
-                            self.pb.progress,
-                            task_id,
-                            active_task_id
-                        ),
-                        'compare_size': sever_file_size
-                    }
-                    download_kwargs['download_client'] = download_client or self.app.client
-                    if memory_download:
-                        download_kwargs['save_file_path'] = save_directory
-                    else:
-                        download_kwargs['file_name'] = temp_file_path
-                    _task = self.loop.create_task(
-                        download_func(
-                            **download_kwargs
-                        )
-                    )
-                    self.active_download_tasks[active_task_id]['task'] = _task
-                    self.active_download_task_ids[_task] = active_task_id
-                    _task.add_done_callback(
-                        partial(
-                            self.download_complete_callback,
-                            sever_file_size,
-                            temp_file_path,
-                            link,
-                            message,
-                            file_name,
-                            retry_count,
-                            file_id,
-                            format_file_size,
-                            task_id,
-                            with_upload,
-                            diy_download_type,
-                            request_client,
-                            request_message,
-                            download_client,
-                            video_filename_mode=video_filename_mode,
-                            memory_download=memory_download
-                        )
-                    )
-                    if tracked_task_meta is not None:
-                        tracked_task_meta['slot_owned_by_active_task'] = True
-                    if memory_download:
-                        log.info(
-                            f'启用内存下载:"{file_name}",大小:{format_file_size},'
-                            f'内存上限:{self.app.memory_download_limit}MB。')
-                    MetaData.print_current_task_num(
-                        prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
-                        num=self.app.current_task_num
-                    )
-            else:
-                _error = '不支持或被忽略的类型(已取消)。'
-                try:
-                    _, __, ___, file_name, ____, format_file_size = self.get_media_meta(
-                        message=message,
-                        dtype=valid_dtype
-                    ).values()
-                    if file_name:
-                        console.log(
-                            f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                            f'{_t(KeyWord.FILE)}:"{file_name}",'
-                            f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                            f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.SKIP))},'
-                            f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SKIP)}。'
-                        )
-                        DownloadTask.set_error(link=link, key=file_name, value=_error.replace('。', ''))
-                    else:
-                        raise Exception('不支持或被忽略的类型。')
-                except Exception as _:
-                    DownloadTask.set_error(link=link, value=_error.replace('。', ''))
-                    console.log(
-                        f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                        f'{_t(KeyWord.CHANNEL)}:"{chat_id}",'  # 频道名。
-                        f'{_t(KeyWord.LINK)}:"{link}",'  # 链接。
-                        f'{_t(KeyWord.LINK_TYPE)}:{_error}'  # 链接类型。
-                    )
-            self.queue.put_nowait(_task) if _task else None
+                    DownloadTask.set_error(link=link, key=file_name, value=_error.replace('。', ''))
+                else:
+                    raise Exception('不支持或被忽略的类型。')
+            except Exception as _:
+                DownloadTask.set_error(link=link, value=_error.replace('。', ''))
+                console.log(
+                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                    f'{_t(KeyWord.CHANNEL)}:"{chat_id}",'  # 频道名。
+                    f'{_t(KeyWord.LINK)}:"{link}",'  # 链接。
+                    f'{_t(KeyWord.LINK_TYPE)}:{_error}'  # 链接类型。
+                )
 
     def __check_download_finish(
             self,
@@ -2749,6 +2767,10 @@ class TelegramRestrictedMediaDownloader(Bot):
                     save_directory=save_directory
                 ).get('e_code')
                 log.warning(result) if result is not None else None
+                if result is not None:
+                    return False
+                if not is_file_duplicate(file_path, sever_file_size):
+                    return False
             console.log(
                 f'{_t(KeyWord.DOWNLOAD_TASK)}'
                 f'{_t(KeyWord.FILE)}:"{file_path}",'
@@ -2767,8 +2789,32 @@ class TelegramRestrictedMediaDownloader(Bot):
         )
         return False
 
+    def __schedule_download_completion(self, *args, **kwargs):
+        task = self.create_background_task(self.download_complete_callback(*args, **kwargs))
+        transfer = args[-1]
+        active_id = self.active_download_task_ids.get(transfer)
+        if active_id in self.active_download_tasks:
+            self.active_download_tasks[active_id]['task'] = task
+        task.add_done_callback(lambda _: self.__finish_download_resources(
+            active_id, transfer, args[0], args[8], kwargs.get('memory_download', False)))
+
+    def __finish_download_resources(self, active_id, transfer, file_size, progress_id, memory):
+        self.active_download_task_ids.pop(transfer, None)
+        task_meta = self.active_download_tasks.pop(active_id, None)
+        if task_meta is None:
+            return
+        path_lock = task_meta.get('path_lock')
+        if path_lock:
+            path_lock.release()
+        self.download_task_semaphore.release()
+        self.app.current_task_num = max(0, self.app.current_task_num - 1)
+        self.event.set()
+        if memory:
+            self.__release_memory_download(file_size)
+        self.pb.progress.remove_task(task_id=progress_id)
+
     @DownloadTask.on_complete
-    def download_complete_callback(
+    async def download_complete_callback(
             self,
             sever_file_size,
             temp_file_path,
@@ -2789,156 +2835,159 @@ class TelegramRestrictedMediaDownloader(Bot):
             memory_download: bool = False
     ):
         active_task_id = self.active_download_task_ids.pop(_future, None)
-        if task_id is None:
-            if retry_count == 0:
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.ALREADY_EXIST)}:"{_future}"'
-                )
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.FILE)}:"{file_name}",'
-                    f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                    f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.SKIP))},'
-                    f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SKIP)}。', style='#e6db74'
-                )
-                DownloadTask.COMPLETE_LINK.add(link)
-                if self.uploader:
-                    if with_upload and isinstance(with_upload, dict):
-                        try:
-                            media_group = message.get_media_group()
-                        except ValueError:
-                            media_group = None
-                        with_upload['message_id'] = message.id
-                        with_upload['media_group'] = media_group
-                        self.uploader.download_upload(
-                            with_upload=with_upload,
-                            file_path=os.path.join(self.env_save_directory(message), file_name)
-                        )
-        else:
-            self.download_task_semaphore.release()
-            self.app.current_task_num = max(0, self.app.current_task_num - 1)
-            self.event.set()  # v1.3.4 修复重试下载被阻塞的问题。
-            active_task_meta = self.active_download_tasks.get(active_task_id)
-            cancel_requested = _future.cancelled() or bool(
-                active_task_meta and active_task_meta.get('cancel_requested')
-            )
-            if cancel_requested:
-                if memory_download:
-                    self.__release_memory_download(sever_file_size)
-                _error = '用户取消下载任务。'
-                console.log(
-                    f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                    f'{_t(KeyWord.FILE)}:"{file_name}",'
-                    f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                    f'{_t(KeyWord.STATUS)}:已取消。',
-                    style='#FF4689'
-                )
-                DownloadTask.set_error(link=link, key=file_name, value=_error.replace('。', ''))
-                self.bot_task_link.discard(link)
-                self.queue.task_done()
-                self.pb.progress.remove_task(task_id=task_id)
-                self.active_download_tasks.pop(active_task_id, None)
-                return None, None
-            downloaded_file_path: str = os.path.join(self.env_save_directory(message), file_name)
-            if memory_download:
-                self.__release_memory_download(sever_file_size)
-                if _future.cancelled():
-                    downloaded_file_path = ''
-                else:
-                    try:
-                        downloaded_file_path = _future.result()
-                    except Exception as e:
-                        downloaded_file_path = ''
-                        log.error(f'内存下载任务失败,{_t(KeyWord.REASON)}:"{e}"')
-                download_success: bool = bool(downloaded_file_path) and is_file_duplicate(
-                    save_directory=downloaded_file_path,
-                    sever_file_size=sever_file_size
-                )
-                if download_success:
+        try:
+            if task_id is None:
+                if retry_count == 0:
                     console.log(
                         f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                        f'{_t(KeyWord.FILE)}:"{downloaded_file_path}",'
-                        f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, downloaded_file_path, DownloadStatus.SUCCESS))},'
-                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SUCCESS)}。'
+                        f'{_t(KeyWord.ALREADY_EXIST)}:"{_future}"'
                     )
-                else:
-                    console.log(
-                        f'{_t(KeyWord.DOWNLOAD_TASK)}'
-                        f'{_t(KeyWord.FILE)}:"{os.path.join(self.env_save_directory(message), file_name)}",'
-                        f'{_t(KeyWord.ACTUAL_SIZE)}:{format_file_size},'
-                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.FAILURE))},'
-                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.FAILURE)}。'
-                    )
-            else:
-                download_success: bool = self.__check_download_finish(
-                        message=message,
-                        sever_file_size=sever_file_size,
-                        temp_file_path=temp_file_path,
-                        save_directory=self.env_save_directory(message),
-                        with_move=True
-                )
-            if download_success:
-                MetaData.print_current_task_num(
-                    prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
-                    num=self.app.current_task_num
-                )
-                if self.uploader:
-                    if with_upload and isinstance(with_upload, dict):
-                        try:
-                            media_group = message.get_media_group()
-                        except ValueError:
-                            media_group = None
-                        with_upload['message_id'] = message.id
-                        with_upload['media_group'] = media_group
-                        self.uploader.download_upload(
-                            with_upload=with_upload,
-                            file_path=downloaded_file_path
-                        )
-                self.queue.task_done()
-            else:
-                if retry_count < self.app.max_download_retries:
-                    retry_count += 1
-                    task = self.loop.create_task(
-                        self.create_download_task(
-                            message_ids=link if isinstance(link, str) and link.startswith('https://t.me/') else message,
-                            retry={
-                                'id': file_id,
-                                'count': retry_count,
-                                'video_filename_mode': video_filename_mode
-                            },
-                            with_upload=with_upload,
-                            diy_download_type=diy_download_type,
-                            request_client=request_client,
-                            request_message=request_message,
-                            download_client=download_client
-                        )
-                    )
-                    task.add_done_callback(
-                        partial(
-                            self.__retry_call,
-                            f'{_t(KeyWord.RE_DOWNLOAD)}:"{file_name}",'
-                            f'{_t(KeyWord.RETRY_TIMES)}:{retry_count}/{self.app.max_download_retries}。'
-                        )
-                    )
-                else:
-                    _error = f'(达到最大重试次数:{self.app.max_download_retries}次)。'
                     console.log(
                         f'{_t(KeyWord.DOWNLOAD_TASK)}'
                         f'{_t(KeyWord.FILE)}:"{file_name}",'
                         f'{_t(KeyWord.SIZE)}:{format_file_size},'
-                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.FAILURE))},'
-                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.FAILURE)}'
-                        f'{_error}'
+                        f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.SKIP))},'
+                        f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SKIP)}。', style='#e6db74'
+                    )
+                    if self.uploader:
+                        if with_upload and isinstance(with_upload, dict):
+                            try:
+                                media_group = message.get_media_group()
+                            except ValueError:
+                                media_group = None
+                            with_upload['message_id'] = message.id
+                            with_upload['media_group'] = media_group
+                            self.uploader.download_upload(
+                                with_upload=with_upload,
+                                file_path=os.path.join(self.env_save_directory(message), file_name)
+                            )
+            else:
+                active_task_meta = self.active_download_tasks.get(active_task_id)
+                cancel_requested = _future.cancelled() or bool(
+                    active_task_meta and active_task_meta.get('cancel_requested')
+                )
+                if cancel_requested:
+                    _error = '用户取消下载任务。'
+                    console.log(
+                        f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                        f'{_t(KeyWord.FILE)}:"{file_name}",'
+                        f'{_t(KeyWord.SIZE)}:{format_file_size},'
+                        f'{_t(KeyWord.STATUS)}:已取消。',
+                        style='#FF4689'
                     )
                     DownloadTask.set_error(link=link, key=file_name, value=_error.replace('。', ''))
                     self.bot_task_link.discard(link)
-                    self.queue.task_done()
-                link, file_name = None, None
-            self.pb.progress.remove_task(task_id=task_id)
-            self.active_download_tasks.pop(active_task_id, None)
-        return link, file_name
+                    return None, None
+                transfer_error = _future.exception()
+                if transfer_error:
+                    log.error(f'下载传输失败:{transfer_error}')
+                downloaded_file_path: str = os.path.join(self.env_save_directory(message), file_name)
+                if memory_download:
+                    if _future.cancelled():
+                        downloaded_file_path = ''
+                    else:
+                        try:
+                            downloaded_file_path = _future.result()
+                        except Exception as e:
+                            downloaded_file_path = ''
+                            log.error(f'内存下载任务失败,{_t(KeyWord.REASON)}:"{e}"')
+                    download_success: bool = bool(downloaded_file_path) and is_file_duplicate(
+                        save_directory=downloaded_file_path,
+                        sever_file_size=sever_file_size
+                    )
+                    if download_success:
+                        console.log(
+                            f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                            f'{_t(KeyWord.FILE)}:"{downloaded_file_path}",'
+                            f'{_t(KeyWord.SIZE)}:{format_file_size},'
+                            f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, downloaded_file_path, DownloadStatus.SUCCESS))},'
+                            f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.SUCCESS)}。'
+                        )
+                    else:
+                        console.log(
+                            f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                            f'{_t(KeyWord.FILE)}:"{os.path.join(self.env_save_directory(message), file_name)}",'
+                            f'{_t(KeyWord.ACTUAL_SIZE)}:{format_file_size},'
+                            f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.FAILURE))},'
+                            f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.FAILURE)}。'
+                        )
+                else:
+                    download_success: bool = not transfer_error and await self.__disk_call(self.__check_download_finish,
+                            message=message,
+                            sever_file_size=sever_file_size,
+                            temp_file_path=temp_file_path,
+                            save_directory=self.env_save_directory(message),
+                            with_move=True
+                    )
+                if download_success:
+                    MetaData.print_current_task_num(
+                        prompt=_t(KeyWord.CURRENT_DOWNLOAD_TASK),
+                        num=self.app.current_task_num
+                    )
+                    if self.uploader:
+                        if with_upload and isinstance(with_upload, dict):
+                            try:
+                                media_group = message.get_media_group()
+                            except ValueError:
+                                media_group = None
+                            with_upload['message_id'] = message.id
+                            with_upload['media_group'] = media_group
+                            self.uploader.download_upload(
+                                with_upload=with_upload,
+                                file_path=downloaded_file_path
+                            )
+                else:
+                    if retry_count < self.app.max_download_retries:
+                        retry_count += 1
+                        retry_task_id = self.__next_active_download_task_id()
+                        self.pending_download_tasks[retry_task_id] = {
+                            'link': link, 'file_name': file_name, 'status': '准备重试',
+                            'request_user_id': getattr(getattr(request_message, 'from_user', None), 'id', None),
+                            'cancel_requested': False
+                        }
+                        task = self.create_background_task(
+                            self.create_download_task(
+                                message_ids=link if isinstance(link, str) and link.startswith('https://t.me/') else message,
+                                retry={
+                                    'id': file_id,
+                                    'count': retry_count,
+                                    'video_filename_mode': video_filename_mode
+                                },
+                                with_upload=with_upload,
+                                diy_download_type=diy_download_type,
+                                request_client=request_client,
+                                request_message=request_message,
+                                track_task_id=retry_task_id,
+                                download_client=download_client
+                            )
+                        )
+                        self.pending_download_tasks[retry_task_id]['task'] = task
+                        task.add_done_callback(partial(self.__finish_pending_request, retry_task_id))
+                        task.add_done_callback(
+                            partial(
+                                self.__retry_call,
+                                f'{_t(KeyWord.RE_DOWNLOAD)}:"{file_name}",'
+                                f'{_t(KeyWord.RETRY_TIMES)}:{retry_count}/{self.app.max_download_retries}。'
+                            )
+                        )
+                    else:
+                        _error = f'(达到最大重试次数:{self.app.max_download_retries}次)。'
+                        console.log(
+                            f'{_t(KeyWord.DOWNLOAD_TASK)}'
+                            f'{_t(KeyWord.FILE)}:"{file_name}",'
+                            f'{_t(KeyWord.SIZE)}:{format_file_size},'
+                            f'{_t(KeyWord.TYPE)}:{_t(self.app.get_file_type(message, file_name, DownloadStatus.FAILURE))},'
+                            f'{_t(KeyWord.STATUS)}:{_t(DownloadStatus.FAILURE)}'
+                            f'{_error}'
+                        )
+                        DownloadTask.set_error(link=link, key=file_name, value=_error.replace('。', ''))
+                        self.bot_task_link.discard(link)
+                    link, file_name = None, None
+            return link, file_name
+        finally:
+            if task_id is not None:
+                self.__finish_download_resources(
+                    active_task_id, _future, sever_file_size, task_id, memory_download)
 
     async def download_chat(
             self,
@@ -3185,13 +3234,14 @@ class TelegramRestrictedMediaDownloader(Bot):
             request_client: Optional[pyrogram.Client] = None,
             request_message: Optional[pyrogram.types.Message] = None,
             track_task_id: Union[str, None] = None,
-            download_slot_acquired: bool = False,
             download_client: Optional[pyrogram.Client] = None
     ) -> dict:
         retry = retry if retry else {'id': -1, 'count': 0}
         diy_download_type = [_ for _ in DownloadType()] if with_upload else diy_download_type
         download_client = download_client or self.app.client
         try:
+            if self.__is_tracked_download_cancelled(track_task_id):
+                raise asyncio.CancelledError
             if isinstance(message_ids, pyrogram.types.Message):
                 chat_id = message_ids.chat.id
                 meta: dict = {
@@ -3218,7 +3268,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                 DownloadTask.set(link, 'request_user_id', request_user_id)
             await self.__add_task(
                 chat_id, link_type, link, message, retry, with_upload, diy_download_type,
-                request_client, request_message, track_task_id, download_slot_acquired, download_client)
+                request_client, request_message, track_task_id, download_client)
             return {
                 'chat_id': chat_id,
                 'member_num': member_num,
@@ -3380,7 +3430,8 @@ class TelegramRestrictedMediaDownloader(Bot):
             return None
 
     def __retry_call(self, notice, _future):
-        self.queue.task_done()
+        if not _future.cancelled():
+            _future.exception()
         console.log(notice, style='#FF4689')
 
     async def __download_media_from_links(self) -> None:
@@ -3398,6 +3449,7 @@ class TelegramRestrictedMediaDownloader(Bot):
                     bot_token=self.app.bot_token,
                     workdir=self.app.work_directory,
                     proxy=self.app.proxy if self.app.enable_proxy else None,
+                    max_concurrent_transmissions=self.app.max_download_task,
                     sleep_threshold=SLEEP_THRESHOLD
                 )
             )
@@ -3415,26 +3467,25 @@ class TelegramRestrictedMediaDownloader(Bot):
         self.is_running = True
         self.running_log.add(self.is_running)
         links: Union[set, None] = self.__process_links(link=self.app.links)
-        # 将初始任务添加到队列中。
-        [await self.loop.create_task(self.create_download_task(message_ids=link, retry=None)) for link in
-         sorted(links)] if links else None
-        # 处理队列中的任务与机器人事件。
-        while not self.queue.empty() or self.is_bot_running:
-            result = await self.queue.get()
-            try:
-                await result
-            except asyncio.CancelledError:
-                log.info('下载任务已取消。')
-            except PermissionError as e:
-                log.error(
-                    '临时文件无法移动至下载路径:\n'
-                    '1.可能存在使用网络路径、挂载硬盘行为(本软件不支持);\n'
-                    '2.可能存在多开软件时,同时操作同一文件或目录导致冲突;\n'
-                    '3.由于软件设计缺陷,没有考虑到不同频道文件名相同的情况(若调整将会导致部分用户更新后重复下载已有文件),当保存路径下文件过多时,可能恰巧存在相同文件名的文件,导致相同文件名无法正常移动,故请定期整理归档下载链接与保存路径下的文件。'
-                    f'{_t(KeyWord.REASON)}:"{e}"')
-        # 等待所有任务完成。
-        await self.queue.join()
-        await self.app.client.stop() if self.app.client.is_connected else None
+        try:
+            for link in sorted(links or ()):
+                self.create_background_task(self.create_download_task(message_ids=link, retry=None))
+            while self.background_tasks or self.is_bot_running:
+                self.background_changed.clear()
+                await self.background_changed.wait()
+        finally:
+            self.is_bot_running = False
+            while self.background_tasks:
+                tasks = tuple(self.background_tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self.uploader:
+                await self.uploader.stop()
+            if self.bot and self.bot.is_connected:
+                await self.bot.stop()
+            if self.app.client.is_connected:
+                await self.app.client.stop()
 
     def run(self) -> None:
         record_error: bool = False
