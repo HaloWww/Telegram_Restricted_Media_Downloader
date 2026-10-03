@@ -359,6 +359,28 @@ class TelegramRestrictedMediaDownloaderClient(pyrogram.Client):
             port: Optional[int] = None,
             temporary: Optional[bool] = False
     ) -> "Session":
+        if dc_id is None:
+            dc_id = await self.storage.dc_id()
+        if not hasattr(self, '_session_creation_locks'):
+            self._session_creation_locks = {}
+        # Other downloads must never see a session before start/import completes.
+        lock = self._session_creation_locks.setdefault((dc_id, is_media), asyncio.Lock())
+        async with lock:
+            return await self._create_session(
+                dc_id, is_media, is_cdn, business_connection_id,
+                export_authorization, server_address, port, temporary)
+
+    async def _create_session(
+            self,
+            dc_id: Optional[int] = None,
+            is_media: Optional[bool] = False,
+            is_cdn: Optional[bool] = False,
+            business_connection_id: Optional[str] = None,
+            export_authorization: Optional[bool] = True,
+            server_address: Optional[str] = None,
+            port: Optional[int] = None,
+            temporary: Optional[bool] = False
+    ) -> "Session":
         if not dc_id:
             dc_id = await self.storage.dc_id()
 
@@ -414,33 +436,35 @@ class TelegramRestrictedMediaDownloaderClient(pyrogram.Client):
             is_media=is_media
         )
 
-        if not temporary:
-            sessions[dc_id] = session
+        try:
+            await session.start()
 
-        await session.start()
-
-        if not is_current_dc and export_authorization:
-            for _ in range(3):
-                exported_auth = await self.invoke(
-                    raw.functions.auth.ExportAuthorization(
-                        dc_id=dc_id
-                    )
-                )
-
-                try:
-                    await session.invoke(
-                        raw.functions.auth.ImportAuthorization(
-                            id=exported_auth.id,
-                            bytes=exported_auth.bytes
+            if not is_current_dc and export_authorization:
+                for _ in range(3):
+                    exported_auth = await self.invoke(
+                        raw.functions.auth.ExportAuthorization(
+                            dc_id=dc_id
                         )
                     )
-                except AuthBytesInvalid:
-                    continue
+
+                    try:
+                        await session.invoke(
+                            raw.functions.auth.ImportAuthorization(
+                                id=exported_auth.id,
+                                bytes=exported_auth.bytes
+                            )
+                        )
+                    except AuthBytesInvalid:
+                        continue
+                    else:
+                        break
                 else:
-                    break
-            else:
-                await session.stop()
-                raise AuthBytesInvalid
+                    raise AuthBytesInvalid
+        except BaseException:
+            await session.stop()
+            raise
+        if not temporary:
+            sessions[dc_id] = session
 
         return session
 
@@ -636,6 +660,7 @@ class TelegramRestrictedMediaDownloaderClient(pyrogram.Client):
                 raise
             except Exception as e:
                 log.exception(e)
+                raise
 
 
 async def get_chunk(
@@ -757,55 +782,59 @@ class TelegramRestrictedMediaDownloaderSession(Session):
 
         log.debug('Sent: %s', message)
 
-        payload = await self.client.loop.run_in_executor(
-            self.connection.protocol.crypto_executor,
-            mtproto.pack,
-            message,
-            self.salt,
-            self.session_id,
-            self.auth_key,
-            self.auth_key_id
-        )
-
         try:
-            await self.connection.send(payload)
-        except OSError as e:
-            self.results.pop(msg_id, None)
-            raise e
+            payload = await self.client.loop.run_in_executor(
+                self.connection.protocol.crypto_executor,
+                mtproto.pack,
+                message,
+                self.salt,
+                self.session_id,
+                self.auth_key,
+                self.auth_key_id
+            )
 
-        if wait_response:
             try:
-                await asyncio.wait_for(self.results[msg_id].event.wait(), timeout)
-            except asyncio.TimeoutError:
-                pass
+                await self.connection.send(payload)
+            except OSError as e:
+                self.results.pop(msg_id, None)
+                raise e
 
-            result = self.results.pop(msg_id).value
+            if wait_response:
+                try:
+                    await asyncio.wait_for(self.results[msg_id].event.wait(), timeout)
+                except asyncio.TimeoutError:
+                    pass
 
-            if result is None:
-                raise TimeoutError('请求超时')
+                result = self.results.pop(msg_id).value
 
-            if isinstance(result, raw.types.RpcError):
-                if isinstance(
-                        data, (raw.functions.InvokeWithoutUpdates, raw.functions.InvokeWithTakeout)
-                ):
-                    data = data.query
+                if result is None:
+                    raise TimeoutError('请求超时')
 
-                RPCError.raise_it(result, type(data))
+                if isinstance(result, raw.types.RpcError):
+                    if isinstance(
+                            data, (raw.functions.InvokeWithoutUpdates, raw.functions.InvokeWithTakeout)
+                    ):
+                        data = data.query
 
-            if isinstance(result, raw.types.BadMsgNotification):
-                e_code: int = result.error_code
+                    RPCError.raise_it(result, type(data))
 
-                if e_code in (16, 17):
-                    log.error(
+                if isinstance(result, raw.types.BadMsgNotification):
+                    e_code: int = result.error_code
+
+                    if e_code in (16, 17):
+                        log.error(
+                            '%s: %s', BadMsgNotification.__name__, BadMsgNotification(e_code)
+                        )
+                        raise BadMsgNotification(e_code)
+
+                    log.warning(
                         '%s: %s', BadMsgNotification.__name__, BadMsgNotification(e_code)
                     )
-                    raise BadMsgNotification(e_code)
+                if isinstance(result, raw.types.BadServerSalt):
+                    self.salt = result.new_server_salt
+                    return await self.send(data, wait_response, timeout)
 
-                log.warning(
-                    '%s: %s', BadMsgNotification.__name__, BadMsgNotification(e_code)
-                )
-            if isinstance(result, raw.types.BadServerSalt):
-                self.salt = result.new_server_salt
-                return await self.send(data, wait_response, timeout)
+                return result
 
-            return result
+        finally:
+            self.results.pop(msg_id, None)

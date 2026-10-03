@@ -96,6 +96,30 @@ class Bot:
         self.adding_keywords: list = []  # 用于跟踪正在添加的关键词列表。
         self.keyword_handler: Union[MessageHandler, None] = None  # 关键词输入模式的handler。
         self.bot_user_input_handler: Union[MessageHandler, None] = None
+        self.background_tasks: set = set()
+        self.background_changed = asyncio.Event()
+
+    def create_background_task(self, coroutine) -> asyncio.Task:
+        """Own background work and always observe its outcome."""
+        task = asyncio.create_task(coroutine)
+        self.background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        self.background_changed.set()
+        return task
+
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        self.background_tasks.discard(task)
+        self.background_changed.set()
+        if not task.cancelled():
+            error = task.exception()
+            if error:
+                log.error('后台任务失败', exc_info=(type(error), error, error.__traceback__))
+
+    def background_handler(self, callback):
+        """Release the dispatcher worker before starting long operations."""
+        async def handler(client, update):
+            self.create_background_task(callback(client, update))
+        return handler
 
     def get_bot_allowed_users(self) -> list:
         application = getattr(self, 'application', None) or getattr(self, 'app', None)
@@ -843,13 +867,13 @@ class Bot:
             link_preview_options=LINK_PREVIEW_OPTIONS
         )
         self.is_bot_running = False
+        self.background_changed.set()
         await self.safe_edit_message(
             client=client,
             message=message,
             last_message_id=last_message.id,
             text='✅退出成功。'
         )
-        raise SystemExit(0)
 
     async def on_listen(
             self,
@@ -1073,6 +1097,7 @@ class Bot:
                         await asyncio.sleep(amount)
                     except Exception as e:
                         log.error(f'无法发送通知,{_t(KeyWord.REASON)}:"{e}"')
+                        return
 
     async def start_bot(
             self,
@@ -1119,7 +1144,7 @@ class Bot:
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.get_download_link_from_bot,
+                    self.background_handler(self.get_download_link_from_bot),
                     filters=pyrogram.filters.command(['download']) & public_filter
                 )
             )
@@ -1137,13 +1162,13 @@ class Bot:
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.get_upload_link_from_bot,
+                    self.background_handler(self.get_upload_link_from_bot),
                     filters=pyrogram.filters.command(['upload']) & admin_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.get_upload_link_from_bot,
+                    self.background_handler(self.get_upload_link_from_bot),
                     filters=pyrogram.filters.command(['upload_r']) & admin_filter
                 )
             )
@@ -1155,7 +1180,7 @@ class Bot:
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.get_forward_link_from_bot,
+                    self.background_handler(self.get_forward_link_from_bot),
                     filters=pyrogram.filters.command(['forward']) & admin_filter
                 )
             )
@@ -1167,7 +1192,7 @@ class Bot:
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.on_listen,
+                    self.background_handler(self.on_listen),
                     filters=pyrogram.filters.command(['listen_download', 'listen_forward']) & admin_filter
                 )
             )
@@ -1179,19 +1204,19 @@ class Bot:
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.get_download_link_from_bot,
+                    self.background_handler(self.get_download_link_from_bot),
                     filters=pyrogram.filters.regex(r'^https://t.me.*') & public_filter
                 )
             )
             self.bot.add_handler(
                 MessageHandler(
-                    self.handle_forwarded_media,
+                    self.background_handler(self.handle_forwarded_media),
                     filters=public_filter & media_filter & ~(root_filter & pyrogram.filters.forwarded)
                 )
             )
             self.user.add_handler(
                 MessageHandler(
-                    self.handle_forwarded_media,
+                    self.background_handler(self.handle_forwarded_media),
                     filters=root_filter & pyrogram.filters.forwarded & pyrogram.filters.chat(
                         bot_username) & (
                                     pyrogram.filters.video
@@ -1206,7 +1231,7 @@ class Bot:
             )
             self.bot.add_handler(
                 CallbackQueryHandler(
-                    self.callback_data,
+                    self.background_handler(self.callback_data),
                     filters=private_callback_filter
                 )
             )
